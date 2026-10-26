@@ -79,7 +79,7 @@ function press(root: ReactTestRenderer.ReactTestInstance, label: string) {
 }
 
 const textOf = (root: ReactTestRenderer.ReactTestInstance) =>
-  root.findAll(n => typeof n.type === 'string' && n.type === 'Text').map(n => [].concat(n.props.children).join('')).join('|');
+  root.findAll(n => (n.type as unknown) === 'Text').map(n => [].concat(n.props.children).join('')).join('|');
 
 test('onboarding → home → studio → effects / mastering / export / settings', async () => {
   let tree!: ReactTestRenderer.ReactTestRenderer;
