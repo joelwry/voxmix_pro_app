@@ -1,0 +1,65 @@
+# Reproducible build: native engine tests on Linux, JS checks, then the Android debug APK
+# (uploaded as an artifact you can download and install on a phone).
+name: Android build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine-tests:
+    name: Native engine tests (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake -S native -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DVOXMIX_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build/host
+      - name: Test
+        run: ./build/host/audio-engine/tests/voxmix_tests
+
+  app:
+    name: JS checks + debug APK
+    runs-on: ubuntu-24.04
+    needs: engine-tests
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Install JS dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Unit tests
+        run: npx jest --ci
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
+      - name: Build debug APK
+        working-directory: apps/mobile/android
+        run: ./gradlew :app:assembleDebug --no-daemon
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxMixPro-debug-apk
+          path: apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

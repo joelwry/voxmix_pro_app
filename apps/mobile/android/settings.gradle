@@ -1,0 +1,9 @@
+pluginManagement { includeBuild("../node_modules/@react-native/gradle-plugin") }
+plugins { id("com.facebook.react.settings") }
+extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
+rootProject.name = 'VoxMixPro'
+include ':app'
+// native audio engine (C++ / Oboe), shared with the desktop test build in native/
+include ':voxengine'
+project(':voxengine').projectDir = new File(rootDir, '../../../native/android/voxengine')
+includeBuild('../node_modules/@react-native/gradle-plugin')

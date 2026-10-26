@@ -139,6 +139,7 @@ Engine::Engine (std::string dir, std::unique_ptr<IAudioDevice> dev)
     blockL.assign (kMaxBlock, 0.0f);
     blockR.assign (kMaxBlock, 0.0f);
     inputMono.assign (16384, 0.0f);
+    calibIn.assign ((size_t) (kCalibFirst + kCalibPeriod * (kCalibClicks + 1)) * 2, 0.0f);
     loudness.prepare (48000);
     cache.sampleRate = 48000;
     cache.maxBlock = kMaxBlock;
@@ -197,6 +198,28 @@ void Engine::onAudio (const float* in, int inChannels, int inFrames, float* out,
             for (int c = 0; c < inChannels; ++c) s += in[i * inChannels + c];
             inputMono[(size_t) i] = s * scale;
         }
+    }
+
+    if (calibActive.load())
+    {
+        // Calibration: output a click train (everything else muted) and capture the input.
+        const int64_t outBase = calibOutCount.load (std::memory_order_relaxed);
+        for (int i = 0; i < outFrames; ++i)
+        {
+            const int64_t k = outBase + i - kCalibFirst;
+            float v = 0.0f;
+            if (k >= 0 && (k % kCalibPeriod) < 96 && k / kCalibPeriod < kCalibClicks)
+                v = 0.5f * (float) std::sin (2.0 * 3.14159265358979 * 1000.0 * double (k % kCalibPeriod) / 48000.0);
+            out[2 * i] = out[2 * i + 1] = v;
+        }
+        calibOutCount.store (outBase + outFrames, std::memory_order_relaxed);
+        int64_t inBase = calibInCount.load (std::memory_order_relaxed);
+        for (int i = 0; i < monoFrames && inBase < (int64_t) calibIn.size(); ++i)
+            calibIn[(size_t) inBase++] = inputMono[(size_t) i];
+        calibInCount.store (inBase, std::memory_order_relaxed);
+        callbacks.fetch_add (1, std::memory_order_relaxed);
+        callbackSeq.fetch_add (1);
+        return;
     }
 
     if (recorder.isArmed() || recorder.isCapturing())
@@ -1630,6 +1653,128 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         return okJson ({ { "running", false }, { "result", json::parse (exportResult) } });
     }
 
+    //-------------------------------------------------------------------- library & app settings
+    if (method == "listExports")
+    {
+        json list = json::array();
+        const std::string dir = dataDir + "/exports";
+        for (const auto& f : fs::list (dir))
+        {
+            if (f.size() < 5 || f.compare (f.size() - 4, 4, ".wav") != 0) continue;
+            const std::string path = dir + "/" + f;
+            struct stat st {};
+            if (::stat (path.c_str(), &st) != 0) continue;
+            list.push_back ({ { "name", f.substr (0, f.size() - 4) }, { "path", path }, { "bytes", (int64_t) st.st_size },
+                              { "modifiedAt", (int64_t) st.st_mtime * 1000 } });
+        }
+        std::sort (list.begin(), list.end(), [] (const json& x, const json& y) { return x["modifiedAt"].get<int64_t>() > y["modifiedAt"].get<int64_t>(); });
+        return okJson ({ { "exports", list } });
+    }
+    if (method == "deleteExport")
+    {
+        const std::string path = reqString (a, "path");
+        if (path.rfind (dataDir + "/exports/", 0) != 0 || path.find ("..") != std::string::npos) fail ("Invalid file");
+        if (std::remove (path.c_str()) != 0) fail ("The file could not be deleted");
+        return okJson();
+    }
+    if (method == "getSettings" || method == "setSettings")
+    {
+        std::string text;
+        json settings = json::object();
+        if (readFile (dataDir + "/settings.json", text))
+        {
+            auto j = json::parse (text, nullptr, false);
+            if (j.is_object()) settings = j;
+        }
+        if (method == "setSettings")
+        {
+            if (! a.contains ("values") || ! a["values"].is_object()) fail ("Missing 'values'");
+            for (auto& [k, v] : a["values"].items()) settings[k] = v;
+            if (! writeFileAtomic (dataDir + "/settings.json", settings.dump (2), err)) fail (err);
+        }
+        return okJson ({ { "settings", settings } });
+    }
+
+    //-------------------------------------------------------------------- latency calibration
+    if (method == "startLatencyTest")
+    {
+        needProject();
+        needIdle();
+        if (device)
+        {
+            if (! wantInput || ! device->status().inputOpen) { wantInput = true; restartDeviceLocked(); }
+            if (! device->status().inputOpen) fail ("The microphone could not be opened. Check the microphone permission.");
+        }
+        playing.store (false);
+        std::fill (calibIn.begin(), calibIn.end(), 0.0f);
+        calibInCount.store (0);
+        calibOutCount.store (0);
+        calibActive.store (true);
+        const double seconds = double (kCalibFirst + kCalibPeriod * kCalibClicks + 9600) / 48000.0;
+        return okJson ({ { "seconds", seconds } });
+    }
+    if (method == "finishLatencyTest")
+    {
+        needProject();
+        calibActive.store (false);
+        if (device && device->status().running)
+            std::this_thread::sleep_for (std::chrono::milliseconds (30));   // let the callback leave calibration
+        const int64_t captured = std::min<int64_t> (calibInCount.load(), (int64_t) calibIn.size());
+        // matched filter: correlate the input with the click and take the best lag per click
+        std::vector<float> tpl (96);
+        for (int i = 0; i < 96; ++i) tpl[(size_t) i] = (float) std::sin (2.0 * 3.14159265358979 * 1000.0 * i / 48000.0);
+        std::vector<int64_t> lags;
+        float bestPeakTotal = 0.0f, noiseTotal = 0.0f;
+        const int maxLag = 24000 - 200;   // up to 500 ms round trip
+        for (int c = 0; c < kCalibClicks; ++c)
+        {
+            const int64_t emitted = kCalibFirst + (int64_t) c * kCalibPeriod;
+            float best = 0.0f, sumAbs = 0.0f;
+            int64_t bestLag = -1;
+            int count = 0;
+            for (int lag = 0; lag < maxLag; ++lag)
+            {
+                const int64_t s0 = emitted + lag;
+                if (s0 + 96 >= captured) break;
+                float acc = 0.0f;
+                for (int i = 0; i < 96; ++i) acc += tpl[(size_t) i] * calibIn[(size_t) (s0 + i)];
+                acc = std::abs (acc);
+                sumAbs += acc; ++count;
+                if (acc > best) { best = acc; bestLag = lag; }
+            }
+            if (bestLag >= 0 && count > 0)
+            {
+                lags.push_back (bestLag);
+                bestPeakTotal += best;
+                noiseTotal += sumAbs / count;
+            }
+        }
+        if (lags.size() < 4) fail ("No clicks were detected. Turn the volume up, unplug headphones and hold the phone in a quiet room.");
+        std::vector<int64_t> sorted = lags;
+        std::sort (sorted.begin(), sorted.end());
+        const int64_t median = sorted[sorted.size() / 2];
+        int consistent = 0;
+        for (auto l : lags) consistent += std::abs (l - median) <= 48;   // within 1 ms
+        const float snr = noiseTotal > 0 ? bestPeakTotal / noiseTotal : 0.0f;
+        const bool reliable = consistent >= (int) lags.size() - 1 && snr > 4.0f;
+        // what the engine would compensate automatically (device part only)
+        int64_t deviceComp = assumedLatency;
+        if (device) { const auto st = device->status(); deviceComp = st.inputLatencyFrames + st.outputLatencyFrames; }
+        const int64_t suggestedOffset = deviceComp - median;
+        const double rate = project.sampleRate;
+        if (reliable && arg<bool> (a, "apply", false))
+        {
+            pushUndo();
+            project.recordOffsetFrames = suggestedOffset;
+            markDirty();
+        }
+        return okJson ({ { "measuredFrames", median }, { "measuredMs", median * 1000.0 / rate },
+                         { "reportedFrames", deviceComp }, { "reportedMs", deviceComp * 1000.0 / rate },
+                         { "suggestedOffsetMs", suggestedOffset * 1000.0 / rate }, { "reliable", reliable },
+                         { "clicksDetected", (int) lags.size() }, { "consistent", consistent }, { "snr", round3 (snr) },
+                         { "applied", reliable && arg<bool> (a, "apply", false) } });
+    }
+
     //-------------------------------------------------------------------- lifecycle & misc
     if (method == "onAppBackground")
     {
@@ -1641,8 +1786,15 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
             r["recording"] = json::parse (rec);
         }
         playing.store (false);
+        calibActive.store (false);
         if (hasProject && dirty && ! saveLocked (err)) r["warning"] = err;
+        if (device) device->stop();   // no audio (and no battery use) in the background
         return okJson (r);
+    }
+    if (method == "onAppForeground")
+    {
+        if (hasProject && device && ! device->status().running) restartDeviceLocked();
+        return okJson();
     }
     if (method == "resetClipIndicators")
     {

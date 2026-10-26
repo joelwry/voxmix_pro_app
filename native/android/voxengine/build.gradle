@@ -1,0 +1,42 @@
+// Android library wrapping the native VoxMix audio engine (C++17 + Oboe).
+// It has no React Native dependency: the app's TurboModule talks to it through VoxEngineNative.
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+
+android {
+    namespace "com.voxmixpro.engine.core"
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion rootProject.ext.ndkVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        def archs = (project.findProperty("reactNativeArchitectures") ?: "arm64-v8a,armeabi-v7a,x86_64").split(",")
+        ndk { abiFilters(*archs) }
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared", "-DCMAKE_BUILD_TYPE=Release"
+                cppFlags "-O3", "-fno-math-errno", "-fno-trapping-math"
+            }
+        }
+    }
+    buildFeatures { prefab true }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+    buildTypes {
+        // the engine is always built optimised: an unoptimised DSP build glitches on phones
+        debug { externalNativeBuild { cmake { arguments "-DCMAKE_BUILD_TYPE=Release" } } }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    implementation "com.google.oboe:oboe:1.10.0"
+}

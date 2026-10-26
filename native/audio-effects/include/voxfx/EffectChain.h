@@ -58,7 +58,6 @@ public:
 private:
     std::vector<EffectSlotPtr> slotList;
     std::vector<float> dryL, dryR;
-    double sampleRate = 48000.0;
     int rampSamples = 480;
 };
 

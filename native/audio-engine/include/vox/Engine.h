@@ -114,6 +114,12 @@ private:
     std::atomic<int> recordTrackIndex { -1 };
     std::atomic<bool> monitorEnabled { false };
     std::string recordTrackId;
+
+    // latency calibration (loopback click test)
+    std::atomic<bool> calibActive { false };
+    std::vector<float> calibIn;
+    std::atomic<int64_t> calibInCount { 0 }, calibOutCount { 0 };
+    static constexpr int kCalibPeriod = 24000, kCalibFirst = 4800, kCalibClicks = 8;
     std::vector<float> inputMono;
 
     // audio thread

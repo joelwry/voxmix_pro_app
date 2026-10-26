@@ -656,3 +656,45 @@ TEST (Performance_TenLayersLongSession)
     CHECK (st["playing"].get<bool>());
     CHECK (st["position"].get<int64_t>() >= 10 * kSr - 192);
 }
+
+TEST (Calibration_MeasuresLoopbackRoundTrip)
+{
+    const auto dir = th::tempDir ("calib");
+    Engine e (dir, nullptr);
+    e.setAssumedRoundTripLatency (600);   // what the "device" claims
+    mustCall (e, "createProject");
+    LoopbackDriver drv { e, 777 };        // what really happens
+    drv.run (0.1);
+    auto s = mustCall (e, "startLatencyTest");
+    drv.run (s["seconds"].get<double>() + 0.1, 0.3f);
+    auto r = mustCall (e, "finishLatencyTest", { { "apply", true } });
+    CHECK_MSG (std::abs (r["measuredFrames"].get<int64_t>() - 777) <= 1, r.dump());
+    CHECK (r["reliable"].get<bool>());
+    CHECK (r["applied"].get<bool>());
+    CHECK_NEAR (r["suggestedOffsetMs"].get<double>(), (600 - 777) / 48.0, 0.05);
+    CHECK (r["project"].is_null());   // returns measurements only
+    CHECK (mustCall (e, "getProject")["project"]["recordOffsetFrames"].get<int64_t>() == 600 - 777);
+
+    // with the offset applied, a recording lands exactly on the beat
+    auto clicksMono = th::clicks (kSr * 3, 4800, 24000);
+    std::vector<float> st (clicksMono.size() * 2);
+    for (size_t i = 0; i < clicksMono.size(); ++i) st[2 * i] = st[2 * i + 1] = clicksMono[i];
+    CHECK (th::writeWav (dir + "/c.wav", st, 2, kSr, 32));
+    auto imp = mustCall (e, "importAudio", { { "path", dir + "/c.wav" } });
+    const std::string lead = trackIdByName (imp["project"], "Lead Vocal");
+    const std::string beat = beatTrack (imp["project"]);
+    mustCall (e, "seek", { { "frame", 0 } });
+    mustCall (e, "startRecording", { { "trackId", lead } });
+    drv.run (2.5);
+    mustCall (e, "stopRecording");
+    mustCall (e, "updateTrack", { { "trackId", beat }, { "mute", true } });
+    auto d = exportAndDecode (e, dir + "/v.wav");
+    auto L = channel (d, 0);
+    const int ref = th::onset (clicksMono, 28800 - 5, 0.05f);
+    CHECK_MSG (std::abs (th::onset (L, 28800 - 2000, 0.05f) - ref) <= 1, "aligned after calibration");
+
+    // silence: the test reports failure instead of a wrong number
+    mustCall (e, "startLatencyTest");
+    drv.run (4.5, 0.0f);
+    CHECK (! call (e, "finishLatencyTest")["ok"].get<bool>());
+}

@@ -12,7 +12,7 @@ EffectSlot::EffectSlot (std::string slotId, EffectPtr fx) : id (std::move (slotI
 }
 
 EffectChain::EffectChain (std::vector<EffectSlotPtr> slots, double sr, int maxBlockSize)
-    : slotList (std::move (slots)), sampleRate (sr)
+    : slotList (std::move (slots))
 {
     dryL.assign ((size_t) std::max (1, maxBlockSize), 0.0f);
     dryR.assign ((size_t) std::max (1, maxBlockSize), 0.0f);
