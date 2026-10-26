@@ -19,7 +19,7 @@ signed with the public React Native debug key: fine for testing, **not for distr
 
 ## Build locally
 
-Requirements: JDK 17+ (21 tested), Node 22, Android SDK with `platforms;android-37`,
+Requirements: JDK 17+ (21 tested), Node 22, Android SDK with `platforms;android-37.0`,
 `build-tools;37.0.0`, `ndk;27.1.12297006`, `cmake;3.22.1` (set `ANDROID_HOME` or
 `apps/mobile/android/local.properties` with `sdk.dir=`).
 

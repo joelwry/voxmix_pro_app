@@ -51,11 +51,15 @@ jobs:
       - name: Unit tests
         run: npx jest --ci
       - name: Install Android SDK packages
-        # the runner image ships the SDK; install exactly the versions the build pins
+        # The runner's preinstalled cmdline-tools are too old to list platform 37, so fetch the
+        # current command-line tools (the same ones used for local builds) and install the
+        # exact versions the build pins.
         run: |
-          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin | sort -V | tail -1)/sdkmanager"
-          yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1" > /dev/null
+          curl -sSfLo "$RUNNER_TEMP/clt.zip" https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip
+          unzip -q "$RUNNER_TEMP/clt.zip" -d "$RUNNER_TEMP/clt"
+          SDKMANAGER="$RUNNER_TEMP/clt/cmdline-tools/bin/sdkmanager --sdk_root=$ANDROID_HOME"
+          (yes || true) | $SDKMANAGER --licenses > /dev/null 2>&1 || true
+          $SDKMANAGER --install "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1" > /dev/null
           echo "sdk.dir=$ANDROID_HOME" > android/local.properties
       - name: Build debug APK
         working-directory: apps/mobile/android
