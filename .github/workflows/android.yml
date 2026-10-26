@@ -50,10 +50,13 @@ jobs:
         run: npx tsc --noEmit
       - name: Unit tests
         run: npx jest --ci
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install SDK packages
-        run: sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
+      - name: Install Android SDK packages
+        # the runner image ships the SDK; install exactly the versions the build pins
+        run: |
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin | sort -V | tail -1)/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1" > /dev/null
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
       - name: Build debug APK
         working-directory: apps/mobile/android
         run: ./gradlew :app:assembleDebug --no-daemon
