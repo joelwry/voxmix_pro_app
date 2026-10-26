@@ -1,0 +1,22 @@
+# build outputs
+/build/
+**/build/
+**/.cxx/
+**/.gradle/
+*.apk
+*.aab
+local.properties
+# node / metro
+node_modules/
+.metro-health-check*
+*.log
+# IDE
+.idea/
+.vscode/
+*.iml
+.DS_Store
+# signing material must never be committed
+*.keystore
+!apps/mobile/android/app/debug.keystore
+*.jks
+keystore.properties
