@@ -121,7 +121,7 @@ private:
     HighPass inputHp;
     std::atomic<bool> inputLowCutOn { true };
     std::atomic<float> inputPeak { 0.0f };
-    std::atomic<bool> inputClipped { false };
+    std::atomic<bool> inputClipped { false }, inputActive { false };
     std::atomic<int64_t> inputOverflow { 0 }, overloads { 0 };
     MonitorFifo monitor;
     std::vector<float> monitorOut;

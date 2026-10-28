@@ -135,66 +135,83 @@ export function Toggle({ value, onChange, label, disabled }: { value: boolean; o
 
 //------------------------------------------------------------------------------------------ slider
 
-/** Horizontal slider. onBegin fires once per gesture (used to snapshot undo), onChange while
-    dragging (throttled by the caller if needed), onEnd on release. Supports log mapping. */
-export function Slider({
-  value, min, max, onChange, onBegin, onEnd, log, step, color = colors.purple, disabled, label,
-}: {
-  value: number; min: number; max: number;
-  onChange: (v: number) => void; onBegin?: () => void; onEnd?: (v: number) => void;
-  log?: boolean; step?: number; color?: string; disabled?: boolean; label?: string;
-}) {
-  const width = useRef(1);
-  const startNorm = useRef(0);
-  const latest = useRef(value);
-  const toNorm = (v: number) => {
-    if (log && min > 0) return Math.log(v / min) / Math.log(max / min);
-    return (v - min) / (max - min || 1);
-  };
+/** Value <-> 0..1 mapping shared by sliders and knobs (log mapping for frequencies, times). */
+function makeMapping(min: number, max: number, log?: boolean, step?: number) {
+  const toNorm = (v: number) => (log && min > 0 ? Math.log(v / min) / Math.log(max / min) : (v - min) / (max - min || 1));
   const fromNorm = (n: number) => {
     n = Math.min(1, Math.max(0, n));
     let v = log && min > 0 ? min * Math.pow(max / min, n) : min + n * (max - min);
     if (step) v = Math.round(v / step) * step;
     return Math.min(max, Math.max(min, v));
   };
-  const cb = useRef({ onChange, onBegin, onEnd });
-  cb.current = { onChange, onBegin, onEnd };
+  return { toNorm, fromNorm };
+}
+
+/** Horizontal slider. It only takes over a gesture that is clearly horizontal, so scrolling a
+    page past it never changes the value; dragging is relative (no jump to the finger), and a
+    double tap resets to `defaultValue`. onBegin fires once per gesture (undo snapshot). */
+export function Slider({
+  value, min, max, onChange, onBegin, onEnd, log, step, color = colors.purple, disabled, label, defaultValue,
+}: {
+  value: number; min: number; max: number;
+  onChange: (v: number) => void; onBegin?: () => void; onEnd?: (v: number) => void;
+  log?: boolean; step?: number; color?: string; disabled?: boolean; label?: string; defaultValue?: number;
+}) {
+  const width = useRef(1);
+  const startNorm = useRef(0);
+  const latest = useRef(value);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const lastTap = useRef(0);
+  const map = makeMapping(min, max, log, step);
+  const mapRef = useRef(map);
+  mapRef.current = map;
+  const cb = useRef({ onChange, onBegin, onEnd, defaultValue });
+  cb.current = { onChange, onBegin, onEnd, defaultValue };
   const pan = useRef(
     PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 6 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
       onPanResponderTerminationRequest: () => false,
-      onPanResponderGrant: e => {
+      onPanResponderGrant: () => {
         cb.current.onBegin?.();
-        const n = e.nativeEvent.locationX / width.current;
-        startNorm.current = n;
-        latest.current = fromNorm(n);
-        cb.current.onChange(latest.current);
+        startNorm.current = mapRef.current.toNorm(valueRef.current);
+        latest.current = valueRef.current;
       },
       onPanResponderMove: (_, g) => {
-        latest.current = fromNorm(startNorm.current + g.dx / width.current);
+        latest.current = mapRef.current.fromNorm(startNorm.current + g.dx / width.current);
         cb.current.onChange(latest.current);
       },
       onPanResponderRelease: () => cb.current.onEnd?.(latest.current),
       onPanResponderTerminate: () => cb.current.onEnd?.(latest.current),
     }),
   ).current;
-  const n = Math.min(1, Math.max(0, toNorm(value)));
+  const n = Math.min(1, Math.max(0, map.toNorm(value)));
   return (
-    <View
+    <Pressable
       accessible
       accessibilityRole="adjustable"
       accessibilityLabel={label}
+      accessibilityHint="Drag sideways to change, double tap to reset"
       accessibilityValue={{ min: 0, max: 100, now: Math.round(n * 100) }}
       onAccessibilityAction={e => {
         const d = e.nativeEvent.actionName === 'increment' ? 0.05 : -0.05;
         cb.current.onBegin?.();
-        const v = fromNorm(n + d);
+        const v = map.fromNorm(n + d);
         cb.current.onChange(v);
         cb.current.onEnd?.(v);
       }}
       accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
-      pointerEvents={disabled ? 'none' : 'auto'}
+      onPress={() => {
+        const now = Date.now();
+        if (now - lastTap.current < 300 && cb.current.defaultValue !== undefined) {
+          cb.current.onBegin?.();
+          cb.current.onChange(cb.current.defaultValue);
+          cb.current.onEnd?.(cb.current.defaultValue);
+        }
+        lastTap.current = now;
+      }}
+      disabled={disabled}
       style={[styles.sliderHit, disabled && { opacity: 0.4 }]}
       onLayout={e => (width.current = Math.max(1, e.nativeEvent.layout.width))}
       {...pan.panHandlers}>
@@ -202,6 +219,92 @@ export function Slider({
         <View style={[styles.sliderFill, { width: `${n * 100}%`, backgroundColor: color }]} />
       </View>
       <View style={[styles.sliderThumb, { left: `${n * 100}%` }]} />
+    </Pressable>
+  );
+}
+
+/** Rotary knob for effect editors. Drag up/down (or sideways) to turn; double tap resets.
+    Editor pages are sized to fit without scrolling, so the knob can take the gesture at once. */
+export function Knob({
+  value, min, max, onChange, onBegin, onEnd, log, step, label, valueText, color = colors.purple, defaultValue, size = 64, disabled,
+}: {
+  value: number; min: number; max: number; onChange: (v: number) => void; onBegin?: () => void; onEnd?: (v: number) => void;
+  log?: boolean; step?: number; label: string; valueText: string; color?: string; defaultValue?: number; size?: number; disabled?: boolean;
+}) {
+  const map = makeMapping(min, max, log, step);
+  const mapRef = useRef(map);
+  mapRef.current = map;
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const startNorm = useRef(0);
+  const latest = useRef(value);
+  const lastTap = useRef(0);
+  const [active, setActive] = useState(false);
+  const cb = useRef({ onChange, onBegin, onEnd, defaultValue });
+  cb.current = { onChange, onBegin, onEnd, defaultValue };
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => {
+        startNorm.current = mapRef.current.toNorm(valueRef.current);
+        latest.current = valueRef.current;
+        setActive(true);
+        const now = Date.now();
+        if (now - lastTap.current < 300 && cb.current.defaultValue !== undefined) {
+          cb.current.onBegin?.();
+          cb.current.onChange(cb.current.defaultValue);
+          cb.current.onEnd?.(cb.current.defaultValue);
+          lastTap.current = 0;
+          return;
+        }
+        lastTap.current = now;
+        cb.current.onBegin?.();
+      },
+      onPanResponderMove: (_, g) => {
+        // 180 px for the full range; up and right both increase
+        const delta = (-g.dy + g.dx * 0.6) / 180;
+        latest.current = mapRef.current.fromNorm(startNorm.current + delta);
+        cb.current.onChange(latest.current);
+      },
+      onPanResponderRelease: () => { setActive(false); cb.current.onEnd?.(latest.current); },
+      onPanResponderTerminate: () => { setActive(false); cb.current.onEnd?.(latest.current); },
+    }),
+  ).current;
+  const n = Math.min(1, Math.max(0, map.toNorm(value)));
+  const angle = -135 + n * 270;
+  // 27 ticks around the dial; lit up to the current value
+  const ticks = Array.from({ length: 28 }, (_, i) => i / 27);
+  return (
+    <View style={{ alignItems: 'center', width: size + 28, opacity: disabled ? 0.4 : 1 }}
+      accessible accessibilityRole="adjustable" accessibilityLabel={`${label} ${valueText}`}
+      accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+      onAccessibilityAction={e => {
+        const v = map.fromNorm(n + (e.nativeEvent.actionName === 'increment' ? 0.05 : -0.05));
+        cb.current.onBegin?.(); cb.current.onChange(v); cb.current.onEnd?.(v);
+      }}>
+      <View style={{ width: size, height: size }} pointerEvents={disabled ? 'none' : 'auto'} {...pan.panHandlers}>
+        {ticks.map(t => {
+          const a = ((-135 + t * 270) * Math.PI) / 180;
+          const r = size / 2 - 2;
+          return (
+            <View key={t} style={{
+              position: 'absolute', width: 3, height: 3, borderRadius: 1.5,
+              left: size / 2 + r * Math.sin(a) - 1.5, top: size / 2 - r * Math.cos(a) - 1.5,
+              backgroundColor: t <= n + 1e-6 ? color : colors.border,
+            }} />
+          );
+        })}
+        <View style={[styles.knobBody, { left: 7, top: 7, width: size - 14, height: size - 14, borderRadius: (size - 14) / 2 },
+          active && { borderColor: color }]}>
+          <View style={{ position: 'absolute', width: '100%', height: '100%', transform: [{ rotate: `${angle}deg` }], alignItems: 'center' }}>
+            <View style={{ width: 3, height: (size - 14) * 0.32, marginTop: 4, borderRadius: 2, backgroundColor: colors.text }} />
+          </View>
+        </View>
+      </View>
+      <Text style={styles.knobValue} numberOfLines={1}>{valueText}</Text>
+      <Text style={styles.knobLabel} numberOfLines={2}>{label}</Text>
     </View>
   );
 }
@@ -358,7 +461,10 @@ export const styles = StyleSheet.create({
   chipText: { color: colors.textDim, fontSize: font.sm, fontWeight: '600' },
   toggle: { width: 46, height: 26, borderRadius: 13, backgroundColor: colors.border, padding: 3 },
   knob: { width: 20, height: 20, borderRadius: 10, backgroundColor: colors.text },
-  sliderHit: { height: 36, justifyContent: 'center' },
+  sliderHit: { height: 40, justifyContent: 'center' },
+  knobBody: { position: 'absolute', backgroundColor: colors.panelHigh, borderWidth: 2, borderColor: colors.border },
+  knobValue: { color: colors.text, fontSize: font.sm, fontWeight: '700', marginTop: 4, fontVariant: ['tabular-nums'] },
+  knobLabel: { color: colors.textDim, fontSize: font.xs, textAlign: 'center', marginTop: 1 },
   sliderTrack: { height: 4, borderRadius: 2, backgroundColor: colors.border, overflow: 'hidden' },
   sliderFill: { height: '100%' },
   sliderThumb: { position: 'absolute', width: 16, height: 16, marginLeft: -8, borderRadius: 8, backgroundColor: colors.text, top: 10 },

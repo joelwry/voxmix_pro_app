@@ -8,7 +8,7 @@ master with loudness matching and export validated WAV files.
 React Native (TypeScript) draws the interface; all audio runs in a native C++17 engine on Google
 Oboe. No audio passes through JavaScript.
 
-**Status: first installable test build (0.1.0, debug).** The engine is covered by 24 native test
+**Status: second test build (0.2.0, debug).** The engine is covered by 32 native test
 suites and the UI by render tests, but **nothing has been tested on a real phone yet**: see
 [docs/TESTING.md](docs/TESTING.md) for the phone checklist and [docs/PROGRESS.md](docs/PROGRESS.md)
 for what is done and what is not.

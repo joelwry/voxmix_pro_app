@@ -84,16 +84,37 @@ later. The take is placed at
 clip.start = startPosition - (inputLatency + outputLatency + masterChainLatency) + userOffset
 ```
 
-Input and output latency come from AAudio hardware timestamps (averaged, `latencyMeasured=true`)
-or from buffer-size estimates on OpenSL ES. Because device reports can be wrong, Project Settings
+The round trip is computed per take from the stream clock captured with the first recorded
+block (output frames written, input frames read) and the latest hardware timestamps of both
+Oboe streams: `rt = W − (outFrame + (inTime + (R − inFrame)/sr − outTime)·sr)`. When timestamps
+are unavailable it falls back to the reported input + output latencies (AAudio averaged
+timestamps, or buffer-size estimates on OpenSL ES). Because device reports can be wrong, Project Settings
 has a loopback **latency calibration** (8 clicks through the speaker, matched-filter detection in
 the mic signal, consistency check) that measures the real round trip and suggests the offset.
 The full path is tested with a simulated loopback device (`Recording_SyncWithSimulatedLoopback`,
 `Calibration_MeasuresLoopbackRoundTrip`): takes land within ±1 frame. **This has not yet been
 validated on real phones.**
 
-Input frames are read every callback (all available frames, non-blocking), so the take's
-sample count is exact even when input and output deliveries jitter. Ring-buffer overflow is
+Input frames are read every callback (all available frames, non-blocking) and only the frames
+the microphone actually delivered are recorded: a callback with 0 input frames adds nothing
+(padding it with silence was the cause of the 0.1.0 crackle), so the take's sample count is
+exact even when input and output deliveries jitter. Input monitoring goes through a small
+jitter FIFO (`RtHelpers.h`) for the same reason. The mic path has a 40 Hz Butterworth low-cut
+and a peak/clip meter; mic mode maps to Android input presets and latency mode to the Oboe
+buffer size.
+
+## Loop, compare and analysis
+
+* **Loop**: the callback splits a block at the loop end, jumps to the loop start and applies a
+  2 ms fade either side of the seam. Recording auto-stop is disabled while looping.
+* **Compare (A/B)**: `setCompare` bypasses a destination's chain (or one slot) in the live graph
+  only; nothing is written to the project or undo history.
+* **Analysis** (`Analysis.cpp`): tempo from spectral-flux onset autocorrelation with octave
+  disambiguation, key from a chroma profile correlated with Krumhansl–Schmuckler profiles.
+  Runs on import of a beat; results stored in `project.analysis`.
+* **Noise reduction**: STFT spectral gating with a noise profile learned from the quietest 15 %
+  of frames, over-subtraction and recursive gain smoothing; writes a new 32-bit source so the
+  original take stays (undoable). Ring-buffer overflow is
 counted and reported with the take, never silently dropped. A new take replaces the overlapped
 region of older clips on the same layer non-destructively (clips are split/trimmed; the media
 files stay, undo restores them).

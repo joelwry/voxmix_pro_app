@@ -6,7 +6,8 @@ import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 
 import { cmd } from '../engine/engine';
 import type { EffectCategory, EffectDescriptor, EffectSlot, FxTarget, ParamInfo } from '../engine/types';
 import { chainFor, targetLabel, useApp } from '../state/AppState';
-import { Button, Chip, DestinationBadge, Field, Header, IconButton, Sheet, Slider, Toggle } from '../ui/components';
+import { Button, Chip, DestinationBadge, Field, Header, IconButton, Knob, Sheet, Slider, Toggle } from '../ui/components';
+import { TransportBar } from '../ui/Transport';
 import { colors, font, radius, space } from '../ui/theme';
 
 const CATEGORY_LABEL: Record<EffectCategory, string> = {
@@ -76,60 +77,183 @@ export function ParamControl({ p, value, onChange, onBegin, onEnd }: {
   );
 }
 
-function SlotCard({ target, slot, desc, index, count, accent }: {
-  target: FxTarget; slot: EffectSlot; desc?: EffectDescriptor; index: number; count: number; accent: string;
+/** One page of an effect editor: up to 6 knobs plus that page's switches and choices. */
+interface Page { title: string; params: ParamInfo[] }
+
+function buildPages(desc: EffectDescriptor): Page[] {
+  const groups: Page[] = [];
+  for (const p of desc.params) {
+    const title = p.group || 'Main';
+    let g = groups.find(x => x.title === title);
+    if (!g) { g = { title, params: [] }; groups.push(g); }
+    g.params.push(p);
+  }
+  // keep every page short enough to fit a phone screen without scrolling
+  const pages: Page[] = [];
+  for (const g of groups) {
+    const knobs = g.params.filter(p => p.type === 'continuous' || p.type === 'integer');
+    const other = g.params.filter(p => p.type === 'toggle' || p.type === 'choice');
+    if (knobs.length <= 6) { pages.push(g); continue; }
+    for (let i = 0; i < knobs.length; i += 6) {
+      pages.push({ title: i === 0 ? g.title : `${g.title} ${i / 6 + 1}`, params: [...(i === 0 ? other : []), ...knobs.slice(i, i + 6)] });
+    }
+  }
+  return pages;
+}
+
+/** The control surface of one effect: page tabs, knobs, switches, choices. Every change goes
+    straight to the DSP (throttled), undo snapshots once per gesture. */
+export function EffectControls({ target, slot, desc, accent, onDrag }: {
+  target: FxTarget; slot: EffectSlot; desc: EffectDescriptor; accent: string; onDrag?: (active: boolean) => void;
 }) {
   const { run } = useApp();
-  const [open, setOpen] = useState(index === 0);
-  const [values, setValues] = useState(slot.params);
-  const [meter, setMeter] = useState(0);
+  const pages = useMemo(() => buildPages(desc), [desc]);
+  const [page, setPage] = useState(0);
+  const [values, setValues] = useState<Record<string, number>>(slot.params);
   const tp = useThrottledParam(target, slot.id);
   useEffect(() => setValues(slot.params), [slot.params]);
+  const current = pages[Math.min(page, pages.length - 1)];
+  const knobs = current?.params.filter(p => p.type === 'continuous' || p.type === 'integer') ?? [];
+  const switches = current?.params.filter(p => p.type === 'toggle') ?? [];
+  const choices = current?.params.filter(p => p.type === 'choice') ?? [];
+  const change = (id: string, v: number) => { setValues(o => ({ ...o, [id]: v })); tp.set(id, v); };
+  const commitOne = (id: string, v: number) => { tp.begin(); change(id, v); tp.end(); run('getProject', {}, { quiet: true }); };
 
-  useEffect(() => {
-    // live gain-reduction / detected-pitch readout while the card is open
-    if (!open || !desc) return;
-    const showMeter = ['compressor', 'deesser', 'limiter', 'gate', 'vocal_sweetener', 'pitch_correction', 'mastering'].includes(desc.type);
-    if (!showMeter) return;
-    const t = setInterval(() => cmd<any>('getEffectState', { target, slotId: slot.id }).then(r => setMeter(r.meter)).catch(() => {}), 150);
-    return () => clearInterval(t);
-  }, [open, desc, target, slot.id]);
-
-  if (!desc) return <View style={s.slot}><Text style={s.dim}>Unknown effect “{slot.type}”</Text></View>;
-  const meterText = desc.type === 'pitch_correction'
-    ? (meter > 0 ? `Detected ${meter.toFixed(1)} Hz` : 'No pitch detected')
-    : `Gain reduction ${meter.toFixed(1)} dB`;
   return (
-    <View style={[s.slot, { borderLeftColor: accent }, slot.bypass && { opacity: 0.6 }]}>
-      <View style={s.slotHead}>
-        <Pressable style={{ flex: 1 }} accessibilityRole="button" accessibilityLabel={`${desc.name} settings`} onPress={() => setOpen(!open)}>
-          <Text style={s.slotName}>{index + 1}. {desc.name}</Text>
-          <Text style={s.dim} numberOfLines={1}>{slot.bypass ? 'Bypassed' : desc.origin}</Text>
-        </Pressable>
-        <Toggle label={`${desc.name} on`} value={!slot.bypass} onChange={on => run('setEffectBypass', { target, slotId: slot.id, bypass: !on })} />
-        {target !== 'mastering' ? (
-          <>
-            <IconButton icon="up" label="Move up" disabled={index === 0} onPress={() => run('moveEffect', { target, slotId: slot.id, index: index - 1 })} />
-            <IconButton icon="down" label="Move down" disabled={index === count - 1} onPress={() => run('moveEffect', { target, slotId: slot.id, index: index + 1 })} />
-            <IconButton icon="close" label={`Remove ${desc.name}`} onPress={() => run('removeEffect', { target, slotId: slot.id })} />
-          </>
+    <View>
+      {pages.length > 1 ? (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.tabs}>
+          {pages.map((pg, i) => (
+            <Pressable key={pg.title} accessibilityRole="tab" accessibilityState={{ selected: i === page }} onPress={() => setPage(i)}
+              style={[s.tab, i === page && { backgroundColor: accent, borderColor: accent }]}>
+              <Text style={[s.tabText, i === page && { color: colors.text }]}>{pg.title}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      ) : null}
+      <View style={s.page}>
+        {switches.length ? (
+          <View style={s.switchRow}>
+            {switches.map(p => {
+              const on = (values[p.id] ?? p.default) >= 0.5;
+              return (
+                <Pressable key={p.id} accessibilityRole="switch" accessibilityState={{ checked: on }} accessibilityLabel={p.name}
+                  onPress={() => commitOne(p.id, on ? 0 : 1)} style={[s.pill, on && { borderColor: accent, backgroundColor: accent + '44' }]}>
+                  <View style={[s.led, on && { backgroundColor: colors.green }]} />
+                  <Text style={[s.pillText, on && { color: colors.text }]}>{p.name.replace(/ On$/, '')}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
         ) : null}
-      </View>
-      {open ? (
-        <View style={{ marginTop: space.sm }}>
-          <Text style={[s.dim, { marginBottom: space.sm }]}>{desc.description}</Text>
-          {['compressor', 'deesser', 'limiter', 'gate', 'vocal_sweetener', 'pitch_correction'].includes(desc.type) ? (
-            <Text style={s.meter}>{meterText}</Text>
-          ) : null}
-          {desc.params.map(p => (
-            <ParamControl key={p.id} p={p} value={values[p.id] ?? p.default}
-              onBegin={tp.begin}
-              onChange={v => { setValues(old => ({ ...old, [p.id]: v })); tp.set(p.id, v); }}
-              onEnd={() => { tp.end(); run('getProject', {}, { quiet: true }); }} />
+        {choices.map(p => (
+          <View key={p.id} style={{ marginBottom: space.sm }}>
+            <Text style={s.choiceLabel}>{p.name}</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              {(p.choices ?? []).map((c, i) => (
+                <Chip key={c} label={c} color={accent} active={Math.round(values[p.id] ?? p.default) === i} onPress={() => commitOne(p.id, i)} />
+              ))}
+            </ScrollView>
+          </View>
+        ))}
+        <View style={s.knobGrid}>
+          {knobs.map(p => (
+            <Knob key={p.id} label={p.name} value={values[p.id] ?? p.default} min={p.min} max={p.max} color={accent}
+              log={p.log && p.min > 0} step={p.type === 'integer' ? 1 : undefined} defaultValue={p.default}
+              valueText={formatValue(p, values[p.id] ?? p.default)}
+              onBegin={() => { onDrag?.(true); tp.begin(); }} onChange={v => change(p.id, v)}
+              onEnd={() => { onDrag?.(false); tp.end(); run('getProject', {}, { quiet: true }); }} />
           ))}
         </View>
-      ) : null}
+        {knobs.length ? <Text style={s.hint}>Drag a knob up or down · double tap to reset</Text> : null}
+      </View>
     </View>
+  );
+}
+
+const METER_TYPES = ['compressor', 'deesser', 'limiter', 'gate', 'vocal_sweetener', 'pitch_correction', 'mastering'];
+
+function LiveMeter({ target, slotId, type }: { target: FxTarget; slotId: string; type: string }) {
+  const [meter, setMeter] = useState(0);
+  useEffect(() => {
+    if (!METER_TYPES.includes(type)) return;
+    const t = setInterval(() => cmd<any>('getEffectState', { target, slotId }).then(r => setMeter(r.meter)).catch(() => {}), 150);
+    return () => clearInterval(t);
+  }, [target, slotId, type]);
+  if (!METER_TYPES.includes(type)) return null;
+  if (type === 'pitch_correction') {
+    const midi = meter > 0 ? 69 + 12 * Math.log2(meter / 440) : 0;
+    const names = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+    const note = meter > 0 ? `${names[((Math.round(midi) % 12) + 12) % 12]}${Math.floor(Math.round(midi) / 12) - 1}` : '';
+    const cents = meter > 0 ? Math.round((midi - Math.round(midi)) * 100) : 0;
+    return <Text style={s.meter}>{meter > 0 ? `Singing ${note} (${cents >= 0 ? '+' : ''}${cents} ct) · ${meter.toFixed(0)} Hz` : 'Tuner: sing to see your pitch'}</Text>;
+  }
+  const gr = Math.max(0, Math.min(24, meter));
+  return (
+    <View style={{ marginBottom: space.sm }}>
+      <Text style={s.meter}>Gain reduction {gr.toFixed(1)} dB</Text>
+      <View style={s.grTrack}><View style={{ width: `${(gr / 24) * 100}%`, height: '100%', backgroundColor: colors.amber }} /></View>
+    </View>
+  );
+}
+
+export function EffectEditorScreen({ target, slotId }: { target: FxTarget; slotId: string }) {
+  const { project, back, describe, run } = useApp();
+  const [presets, setPresets] = useState<Array<{ id: string; name: string }>>([]);
+  const [dragging, setDragging] = useState(false);
+  const slot = chainFor(project, target).find(x => x.id === slotId);
+  const desc = slot ? describe(slot.type) : undefined;
+  useEffect(() => {
+    if (slot) cmd<any>('listEffectPresets', { type: slot.type }).then(r => setPresets(r.presets)).catch(() => setPresets([]));
+  }, [slot?.type]); // eslint-disable-line react-hooks/exhaustive-deps
+  const dest = targetLabel(project, target);
+  const accent = { layer: dest.color ?? colors.layerFx, bus: colors.busFx, master: colors.masterFx, mastering: colors.mastering }[dest.kind];
+  if (!slot || !desc) return <View style={{ flex: 1 }}><Header title="Effect" onBack={back} /><Text style={[s.dim, { padding: space.lg }]}>This effect was removed.</Text></View>;
+  return (
+    <View style={{ flex: 1 }}>
+      <Header title={desc.name} subtitle={desc.origin} onBack={back}
+        right={<Toggle label={`${desc.name} on`} value={!slot.bypass} onChange={on => run('setEffectBypass', { target, slotId, bypass: !on })} />} />
+      <TransportBar soloTrackId={dest.kind === 'layer' ? target.slice(6) : undefined} compareTarget={`slot:${slotId}`} compareLabel="Effect off" />
+      <ScrollView contentContainerStyle={{ padding: space.lg, paddingBottom: 40 }} scrollEnabled={!dragging}>
+        <DestinationBadge kind={dest.kind} name={dest.name} color={dest.color} />
+        <Text style={[s.dim, { marginVertical: space.sm }]}>{desc.description}</Text>
+        {slot.bypass ? <Text style={[s.meter, { color: colors.amber }]}>This effect is switched off (bypassed).</Text> : null}
+        <LiveMeter target={target} slotId={slotId} type={slot.type} />
+        {presets.length ? (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: space.sm }}>
+            {presets.map(p => <Chip key={p.id} label={p.name} color={accent} onPress={() => run('applyEffectPreset', { target, slotId, presetId: p.id }, { success: `${p.name} loaded` })} />)}
+          </ScrollView>
+        ) : null}
+        <EffectControls target={target} slot={slot} desc={desc} accent={accent} onDrag={setDragging} />
+        <View style={{ flexDirection: 'row', gap: space.sm, marginTop: space.md }}>
+          <Button small variant="ghost" title="Reset to defaults" style={{ flex: 1 }}
+            onPress={() => run('setEffectParams', { target, slotId, commit: true, params: Object.fromEntries(desc.params.map(p => [p.id, p.default])) }, { quiet: true }).then(() => run('getProject', {}, { quiet: true }))} />
+          {target !== 'mastering' ? (
+            <Button small variant="danger" title="Remove" style={{ flex: 1 }} onPress={async () => { if (await run('removeEffect', { target, slotId })) back(); }} />
+          ) : null}
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
+function SlotRow({ target, slot, desc, index, count, accent }: {
+  target: FxTarget; slot: EffectSlot; desc?: EffectDescriptor; index: number; count: number; accent: string;
+}) {
+  const { run, navigate } = useApp();
+  if (!desc) return <View style={s.slot}><Text style={s.dim}>Unknown effect “{slot.type}”</Text></View>;
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel={`Open ${desc.name}`} onPress={() => navigate({ name: 'effectEditor', target, slotId: slot.id })}
+      style={({ pressed }) => [s.slot, { borderLeftColor: accent }, slot.bypass && { opacity: 0.55 }, pressed && { backgroundColor: colors.panelHigh }]}>
+      <View style={[s.slotNum, { backgroundColor: accent }]}><Text style={s.slotNumText}>{index + 1}</Text></View>
+      <View style={{ flex: 1 }}>
+        <Text style={s.slotName} numberOfLines={1}>{desc.name}</Text>
+        <Text style={s.dim} numberOfLines={1}>{slot.bypass ? 'Off' : CATEGORY_LABEL[desc.category]} · tap to edit</Text>
+      </View>
+      <Toggle label={`${desc.name} on`} value={!slot.bypass} onChange={on => run('setEffectBypass', { target, slotId: slot.id, bypass: !on })} />
+      <IconButton icon="up" label="Move up" disabled={index === 0} onPress={() => run('moveEffect', { target, slotId: slot.id, index: index - 1 })} />
+      <IconButton icon="down" label="Move down" disabled={index === count - 1} onPress={() => run('moveEffect', { target, slotId: slot.id, index: index + 1 })} />
+    </Pressable>
   );
 }
 
@@ -144,23 +268,26 @@ export function EffectsScreen({ target }: { target: FxTarget }) {
   return (
     <View style={{ flex: 1 }}>
       <Header title={title} onBack={back} />
-      <View style={{ paddingHorizontal: space.lg, gap: space.sm }}>
+      <TransportBar soloTrackId={dest.kind === 'layer' ? target.slice(6) : undefined} compareTarget={chain.length ? target : undefined}
+        compareLabel={dest.kind === 'master' ? 'Master FX off' : 'FX off'} />
+      <View style={{ paddingHorizontal: space.lg, paddingTop: space.md, gap: space.sm }}>
         <DestinationBadge kind={dest.kind} name={dest.name} color={dest.color} />
         <Text style={s.dim}>
-          {dest.kind === 'layer' ? 'These effects change only this layer.' : dest.kind === 'bus' ? 'These effects process every layer routed to this bus.'
+          {dest.kind === 'layer' ? 'These effects change only this layer. Press play (and Loop) to hear them while you adjust.'
+            : dest.kind === 'bus' ? 'These effects process every layer routed to this bus.'
             : 'These effects process the whole song: beat and all vocals.'}
         </Text>
         <View style={{ flexDirection: 'row', gap: space.sm }}>
           <Button small title="+ Add effect" style={{ flex: 1 }} onPress={() => setBrowser(true)} />
-          <Button small title="Presets" variant="secondary" style={{ flex: 1 }} onPress={() => setPresetsOpen(true)} />
+          <Button small title="Chain presets" variant="secondary" style={{ flex: 1 }} onPress={() => setPresetsOpen(true)} />
         </View>
       </View>
       <ScrollView contentContainerStyle={{ padding: space.lg, paddingBottom: 60 }}>
         {chain.length === 0 ? <Text style={s.dim}>No effects yet. Add one, or start from a preset.</Text> : null}
         {chain.map((slot, i) => (
-          <SlotCard key={slot.id} target={target} slot={slot} desc={describe(slot.type)} index={i} count={chain.length} accent={accent} />
+          <SlotRow key={slot.id} target={target} slot={slot} desc={describe(slot.type)} index={i} count={chain.length} accent={accent} />
         ))}
-        {chain.length > 0 ? <Text style={[s.dim, { marginTop: space.sm }]}>Processing order: top to bottom.</Text> : null}
+        {chain.length > 0 ? <Text style={[s.dim, { marginTop: space.sm }]}>Signal flows top to bottom.</Text> : null}
       </ScrollView>
       <EffectBrowser visible={browser} onClose={() => setBrowser(false)} target={target} />
       <PresetBrowser visible={presetsOpen} onClose={() => setPresetsOpen(false)} target={target} />
@@ -169,7 +296,7 @@ export function EffectsScreen({ target }: { target: FxTarget }) {
 }
 
 export function EffectBrowser({ visible, onClose, target }: { visible: boolean; onClose: () => void; target: FxTarget }) {
-  const { catalog, run } = useApp();
+  const { catalog, run, navigate } = useApp();
   const [q, setQ] = useState('');
   const [cat, setCat] = useState<EffectCategory | 'all'>('all');
   const list = useMemo(() => catalog.filter(d => d.category !== 'mastering')
@@ -185,7 +312,7 @@ export function EffectBrowser({ visible, onClose, target }: { visible: boolean; 
       </ScrollView>
       {list.map(d => (
         <Pressable key={d.type} accessibilityRole="button" accessibilityLabel={`Add ${d.name}`}
-          onPress={async () => { if (await run('addEffect', { target, type: d.type })) onClose(); }} style={s.browserRow}>
+          onPress={async () => { const r = await run<any>('addEffect', { target, type: d.type }); if (r) { onClose(); if (r.slotId) navigate({ name: 'effectEditor', target, slotId: r.slotId }); } }} style={s.browserRow}>
           <View style={{ flex: 1 }}>
             <Text style={s.slotName}>{d.name}</Text>
             <Text style={s.dim} numberOfLines={2}>{d.description}</Text>
@@ -247,7 +374,21 @@ export function PresetBrowser({ visible, onClose, target }: { visible: boolean; 
 
 const s = StyleSheet.create({
   dim: { color: colors.textDim, fontSize: font.sm },
-  slot: { backgroundColor: colors.panel, borderRadius: radius.md, padding: space.md, marginBottom: space.md, borderLeftWidth: 4, borderColor: colors.border },
+  slot: { flexDirection: 'row', alignItems: 'center', gap: space.sm, backgroundColor: colors.panel, borderRadius: radius.md, paddingVertical: space.sm, paddingLeft: space.md, paddingRight: 4, marginBottom: space.sm, borderLeftWidth: 4, borderColor: colors.border, minHeight: 64 },
+  slotNum: { width: 26, height: 26, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
+  slotNumText: { color: colors.text, fontWeight: '800', fontSize: font.sm },
+  tabs: { gap: space.sm, paddingVertical: space.xs },
+  tab: { paddingHorizontal: space.md, minHeight: 36, borderRadius: radius.lg, borderWidth: 1, borderColor: colors.border, justifyContent: 'center', backgroundColor: colors.panel },
+  tabText: { color: colors.textDim, fontWeight: '700', fontSize: font.sm },
+  page: { backgroundColor: colors.panel, borderRadius: radius.lg, padding: space.md, marginTop: space.sm, borderWidth: 1, borderColor: colors.border },
+  switchRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm, marginBottom: space.md },
+  pill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: space.md, minHeight: 36, borderRadius: radius.lg, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bgElevated },
+  led: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.textFaint },
+  pillText: { color: colors.textDim, fontSize: font.sm, fontWeight: '600' },
+  choiceLabel: { color: colors.textDim, fontSize: font.sm, marginBottom: 6 },
+  knobGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-around', rowGap: space.md },
+  hint: { color: colors.textFaint, fontSize: font.xs, textAlign: 'center', marginTop: space.md },
+  grTrack: { height: 6, borderRadius: 3, backgroundColor: colors.border, overflow: 'hidden', marginTop: 4 },
   slotHead: { flexDirection: 'row', alignItems: 'center', gap: 2 },
   slotName: { color: colors.text, fontSize: font.md, fontWeight: '700' },
   paramRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', minHeight: 32 },

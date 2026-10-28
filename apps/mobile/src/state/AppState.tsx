@@ -15,6 +15,7 @@ export type Route =
   | { name: 'studio' }
   | { name: 'layers' }
   | { name: 'effects'; target: FxTarget }
+  | { name: 'effectEditor'; target: FxTarget; slotId: string }
   | { name: 'mastering' }
   | { name: 'export' }
   | { name: 'projectSettings' };

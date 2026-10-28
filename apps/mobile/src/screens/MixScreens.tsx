@@ -1,14 +1,16 @@
 // Layer management, Mastering workspace, Export & share, Project settings (incl. audio device
 // and latency calibration).
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { cmd, formatBytes, formatTime, getDeviceInfo, Reply, saveFileAs, shareFile, useStatus } from '../engine/engine';
 import type { DeviceInfo, ExportResult, MasteringPreset } from '../engine/types';
+import { KEY_NAMES, keyLabel } from '../engine/types';
 import { useApp } from '../state/AppState';
 import { Button, Card, Chip, DestinationBadge, Field, Header, IconButton, LevelMeter, Progress, SectionTitle, Slider, Toggle } from '../ui/components';
 import { colors, font, radius, space } from '../ui/theme';
-import { ParamControl } from './EffectsScreen';
+import { EffectControls } from './EffectsScreen';
+import { TransportBar } from '../ui/Transport';
 import { TrackSheet } from './StudioScreen';
 
 //------------------------------------------------------------------------------------------ layers
@@ -86,22 +88,18 @@ function LoudnessPanel() {
 }
 
 export function MasteringScreen() {
-  const { project, run, back, describe, toast } = useApp();
+  const { project, run, back, describe } = useApp();
   const [presets, setPresets] = useState<MasteringPreset[]>([]);
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<string>('');
-  const [values, setValues] = useState<Record<string, number>>({});
-  const playing = useStatus(s => s.playing, false);
-  const pending = useRef<Record<string, number>>({});
   useEffect(() => { run<Reply & { presets: MasteringPreset[] }>('listMasteringPresets', {}, { quiet: true }).then(r => r && setPresets(r.presets)); }, [run]);
-  useEffect(() => { if (project) setValues(project.master.mastering.params); }, [project?.master.mastering.params]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!project) return null;
   const m = project.master;
   const desc = describe('mastering');
   return (
     <View style={{ flex: 1 }}>
-      <Header title="Mastering" onBack={back}
-        right={<IconButton icon={playing ? 'pause' : 'play'} label={playing ? 'Pause' : 'Play'} onPress={() => run(playing ? 'pause' : 'play', {}, { quiet: true })} />} />
+      <Header title="Mastering" onBack={back} />
+      <TransportBar compareTarget={m.masteringOn ? 'mastering' : undefined} compareLabel="Unmastered" />
       <ScrollView contentContainerStyle={{ padding: space.lg, paddingBottom: 60 }}>
         <DestinationBadge kind="mastering" name="Final master (after Master FX)" />
         <Card style={{ marginTop: space.md }}>
@@ -113,8 +111,8 @@ export function MasteringScreen() {
             <Toggle label="Mastering on" value={m.masteringOn} onChange={v => run('updateMaster', { masteringOn: v })} />
           </View>
           <Text style={[st.dim, { marginTop: space.sm }]}>
-            Compare: switch mastering off and on while playing to hear the difference. The comparison is not level-matched yet,
-            so the louder version can sound better; use the loudness readings below.
+            Use A/B in the bar above to hear the unmastered mix while playing (loop a chorus with Loop). The comparison is not
+            level-matched, so the louder version can sound better: judge with the loudness readings below.
           </Text>
         </Card>
 
@@ -153,17 +151,8 @@ export function MasteringScreen() {
         <LoudnessPanel />
 
         <SectionTitle>Mastering controls</SectionTitle>
-        <Card>
-          {desc?.params.map(p => (
-            <ParamControl key={p.id} p={p} value={values[p.id] ?? p.default}
-              onBegin={() => cmd('setEffectParams', { target: 'mastering', params: {}, commit: true }).catch(() => {})}
-              onChange={v => {
-                setValues(o => ({ ...o, [p.id]: v }));
-                pending.current[p.id] = v;
-                cmd('setEffectParams', { target: 'mastering', params: { [p.id]: v } }).catch(e => toast(String(e.message), 'error'));
-              }}
-              onEnd={() => run('getProject', {}, { quiet: true })} />
-          ))}
+        {desc ? <EffectControls target="mastering" slot={m.mastering} desc={desc} accent={colors.mastering} /> : null}
+        <Card style={{ marginTop: space.md }}>
           <Text style={st.dim}>Master volume (before the mastering chain)</Text>
           <Slider label="Master volume" value={m.volumeDb} min={-24} max={6} step={0.1}
             onChange={v => run('updateMaster', { volumeDb: v, quiet: true }, { quiet: true })} onEnd={() => run('getProject', {}, { quiet: true })} />
@@ -286,7 +275,8 @@ export function ExportScreen() {
 //------------------------------------------------------------------------------------------ project settings
 
 export function ProjectSettingsScreen() {
-  const { project, run, back } = useApp();
+  const { project, run, back, toast } = useApp();
+  const [analyzing, setAnalyzing] = useState(false);
   const [name, setName] = useState(project?.name ?? '');
   const [bpm, setBpm] = useState(String(project?.bpm ?? 120));
   const [offset, setOffset] = useState(project ? (project.recordOffsetFrames / project.sampleRate) * 1000 : 0);
@@ -327,6 +317,70 @@ export function ProjectSettingsScreen() {
           ))}
         </View>
         <Button title="Save name & tempo" onPress={() => run('updateProject', { name: name.trim() || project.name, bpm: Number(bpm) || project.bpm }, { success: 'Saved' })} />
+
+        <SectionTitle>Song key & tempo</SectionTitle>
+        <Card>
+          {project.analysis.done ? (
+            <>
+              <View style={st.kvRow}><Text style={st.dim}>Detected tempo</Text>
+                <Text style={st.kvValue}>{project.analysis.bpm ? `${project.analysis.bpm} BPM (${Math.round(project.analysis.bpmConfidence * 100)}% sure)` : 'not detected'}</Text></View>
+              <View style={st.kvRow}><Text style={st.dim}>Detected key</Text>
+                <Text style={st.kvValue}>{project.analysis.keyRoot >= 0 ? `${keyLabel(project.analysis.keyRoot, project.analysis.keyMinor)} (${Math.round(project.analysis.keyConfidence * 100)}% sure)` : 'not detected'}</Text></View>
+              {project.analysis.altKeyRoot >= 0 ? (
+                <View style={st.kvRow}><Text style={st.dim}>Could also be</Text><Text style={st.kvValue}>{keyLabel(project.analysis.altKeyRoot, project.analysis.altKeyMinor)}</Text></View>
+              ) : null}
+            </>
+          ) : <Text style={st.dim}>Import a beat: its tempo and key are detected automatically.</Text>}
+          <Text style={st.dim}>Detection is an estimate: correct it below if it is wrong.</Text>
+          <Text style={st.label}>Key</Text>
+          <View style={st.chips}>
+            {KEY_NAMES.map((k, i) => <Chip key={k} label={k} active={project.analysis.keyRoot === i} onPress={() => run('setKey', { root: i, minor: project.analysis.keyMinor })} />)}
+          </View>
+          <View style={st.chips}>
+            <Chip label="Major" active={project.analysis.keyRoot >= 0 && !project.analysis.keyMinor} onPress={() => run('setKey', { root: Math.max(0, project.analysis.keyRoot), minor: false })} />
+            <Chip label="Minor" active={project.analysis.keyRoot >= 0 && project.analysis.keyMinor} onPress={() => run('setKey', { root: Math.max(0, project.analysis.keyRoot), minor: true })} />
+          </View>
+          <View style={{ gap: space.sm, marginTop: space.sm }}>
+            <Button small variant="secondary" title="Detect again (and use the detected tempo)" busy={analyzing} onPress={async () => {
+              setAnalyzing(true);
+              const r = await run<any>('analyzeBeat', { applyTempo: true });
+              setAnalyzing(false);
+              if (r) { setBpm(String(r.project.bpm)); toast(`${r.analysis.bpm} BPM · ${r.analysis.key || 'key unclear'}`); }
+            }} />
+            <Button small variant="secondary" title="Set every Pitch Correction to this key" disabled={project.analysis.keyRoot < 0}
+              onPress={async () => { const r = await run<any>('applyKeyToPitchCorrection'); if (r) toast(`${r.changed} pitch correction ${r.changed === 1 ? 'effect' : 'effects'} updated`); }} />
+          </View>
+        </Card>
+
+        <SectionTitle>Recording quality</SectionTitle>
+        <Card>
+          <Text style={st.name}>Microphone mode</Text>
+          <View style={st.chips}>
+            {([['raw', 'Studio (raw)'], ['voice', 'Voice'], ['auto', 'Auto level'], ['clean', 'Noise reduction']] as const).map(([id, label]) => (
+              <Chip key={id} label={label} active={project.recording.micMode === id} onPress={() => run('updateProject', { micMode: id })} />
+            ))}
+          </View>
+          <Text style={st.dim}>
+            {{ raw: 'No phone processing: the most natural sound for singing. Keep a hand-width from the mic to avoid clipping.',
+               voice: 'Light processing tuned for voice.',
+               auto: 'The phone adjusts the level automatically (avoids clipping, but breathes on loud/soft parts).',
+               clean: 'The phone removes background noise and echo. Can sound processed; use in noisy rooms.' }[project.recording.micMode]}
+          </Text>
+          <Text style={[st.name, { marginTop: space.md }]}>Latency mode</Text>
+          <View style={st.chips}>
+            {([['lowest', 'Lowest'], ['balanced', 'Balanced'], ['safe', 'Safe']] as const).map(([id, label]) => (
+              <Chip key={id} label={label} active={project.recording.latencyMode === id} onPress={() => run('updateProject', { latencyMode: id })} />
+            ))}
+          </View>
+          <Text style={st.dim}>If a take reports lost audio or you hear crackles, choose Safe: a bigger buffer, the timing of takes stays exact.</Text>
+          <View style={[st.kvRow, { marginTop: space.md }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={st.name}>Low cut on the microphone</Text>
+              <Text style={st.dim}>Removes rumble, handling and wind noise below 40 Hz.</Text>
+            </View>
+            <Toggle label="Low cut" value={project.recording.inputLowCut} onChange={v => run('updateProject', { inputLowCut: v })} />
+          </View>
+        </Card>
 
         <SectionTitle>Recording</SectionTitle>
         <Card>

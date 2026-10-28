@@ -4,7 +4,7 @@
 
 | Suite | Command | What it covers |
 |---|---|---|
-| Native engine + DSP (host) | `scripts/test-native.sh` | 24 tests, ~2 560 checks (see below) |
+| Native engine + DSP (host) | `scripts/test-native.sh` | 32 tests, ~2 675 checks (see below) |
 | JS (Jest) | `cd apps/mobile && npx jest` | Every main screen renders against a fake engine; onboarding → home → studio → Layer FX / Master FX / Mastering / Export / Layers / Settings |
 | Typecheck | `cd apps/mobile && npx tsc --noEmit` | |
 | CI | `.github/workflows/android.yml` | all of the above + debug APK artifact |
@@ -26,6 +26,12 @@ Native tests use synthetic signals (sines, noise, impulses, click tracks):
   1 000 frames late: two takes (from 0 s and from 2 s) are placed within ±1 frame of the beat's
   clicks, survive a reload, and a retake replaces the overlapped region non-destructively
   (undo restores it).
+* **Jittery full-duplex input** (0 frames, then 2×): takes have no gaps or drift and stay
+  on the beat; monitoring output is continuous.
+* **Loop region** repeats seamlessly; **vocal import** onto a new layer; **A/B compare**
+  bypasses without saving; **mic low-cut** removes DC and meters the input.
+* **Analysis**: a synthetic 100 BPM A-minor beat is detected as 100 BPM / A minor.
+  **Noise reduction**: −12.8 dB noise, voice level unchanged (±0.1 dB).
 * **Latency calibration**: measures a 777-frame loopback exactly, computes the offset, and a
   following recording lands on the beat; silence reports failure instead of a wrong number.
 * **Projects**: save/reopen round-trip is identical; corrupt `project.json` falls back to the
@@ -75,7 +81,12 @@ Use the debug APK. Record results (phone model, Android version, headphones) in 
     the phone; return from background; play again.
 15. **Performance**: 6–10 layers with presets; watch for crackles; note the CPU value
     (debug overlay not yet exposed — report audible glitches).
-16. **Storage**: with < 20 MB free, recording is refused with a message.
+16. **Round 2 checks**: record 1 min with wired headphones, listen for clicks (should be none;
+    the toast should say "Clean take"). Long-press the ruler → 4-bar loop; open Layer FX →
+    an effect → play, turn knobs, A/B. Scroll the effect editor without touching knobs: no
+    value changes. Import a beat → key/BPM toast is plausible. "+ Layer" → import a vocal.
+    Clean noise (Medium) on a take recorded with a fan running. Home screen shows the icon.
+17. **Storage**: with < 20 MB free, recording is refused with a message.
 
 ## Not yet verified (be aware)
 

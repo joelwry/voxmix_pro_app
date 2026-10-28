@@ -68,6 +68,12 @@ export interface Project {
   timeSignature: [number, number];
   recordOffsetFrames: number;
   inputMonitoring: boolean;
+  recording: { micMode: 'raw' | 'voice' | 'auto' | 'clean'; latencyMode: 'lowest' | 'balanced' | 'safe'; inputLowCut: boolean };
+  loop: { on: boolean; start: number; end: number };
+  analysis: {
+    done: boolean; sourceId: string; bpm: number; bpmConfidence: number;
+    keyRoot: number; keyMinor: boolean; keyConfidence: number; altKeyRoot: number; altKeyMinor: boolean;
+  };
   sources: Source[];
   tracks: Track[];
   buses: Bus[];
@@ -102,6 +108,7 @@ export interface ParamInfo {
   unit: string;
   log: boolean;
   choices?: string[];
+  group: string;
 }
 
 export type EffectCategory = 'pitch' | 'dynamics' | 'space' | 'creative' | 'chain' | 'mastering';
@@ -181,6 +188,8 @@ export interface EngineStatus {
   master?: MeterReading;
   loudness: { momentary: number; shortTerm: number; integrated: number; truePeak: number };
   record?: { frames: number; dropped: number; inputPeak: number };
+  input?: { open: boolean; peak: number; clipped: boolean };
+  overloads?: number;
   export: { running: boolean; progress: number; result?: ExportResult };
   deviceError?: string;
 }
@@ -199,3 +208,8 @@ export interface DeviceInfo {
 
 /** Effect destinations: a layer, a bus, the whole mix, or the mastering chain. */
 export type FxTarget = `track:${string}` | `bus:${string}` | 'master' | 'mastering';
+
+export const KEY_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+export const keyLabel = (root: number, minor: boolean) => (root < 0 ? 'Unknown' : `${KEY_NAMES[root]} ${minor ? 'minor' : 'major'}`);
+
+export interface TakeHealth { droppedFrames: number; inputOverruns: number; cpuOverloads: number; clipped: boolean; clean: boolean }

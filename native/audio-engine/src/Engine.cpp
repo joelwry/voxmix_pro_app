@@ -192,6 +192,7 @@ void Engine::onAudio (const float* in, int inChannels, int inFrames, float* out,
     // Input: an open input stream may deliver 0 frames in one callback and more in the next
     // (full-duplex jitter). Those frames are recorded exactly as delivered: never padded.
     const bool inputOpen = in != nullptr && inChannels > 0;
+    inputActive.store (inputOpen, std::memory_order_relaxed);
     int monoFrames = 0;
     if (inputOpen && inFrames > 0)
     {
@@ -653,7 +654,7 @@ std::string Engine::status()
     if (recorder.isArmed() || recorder.isCapturing())
         s["record"] = { { "frames", recorder.capturedFrames() }, { "dropped", recorder.droppedFrames() },
                         { "inputPeak", round3 (recorder.takeInputPeak()) } };
-    s["input"] = { { "peak", round3 (inputPeak.exchange (0.0f)) }, { "clipped", inputClipped.load() } };
+    s["input"] = { { "open", inputActive.load() }, { "peak", round3 (inputPeak.exchange (0.0f)) }, { "clipped", inputClipped.load() } };
     s["overloads"] = overloads.load();
     s["export"] = { { "running", exportRunning.load() }, { "progress", round3 (exportProgress.progress.load()) } };
     {

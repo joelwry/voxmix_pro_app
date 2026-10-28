@@ -1,7 +1,7 @@
 // Welcome / onboarding, Home (projects), Library (exported songs), App settings.
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { Alert, FlatList, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, FlatList, Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { formatBytes, formatTime, getDeviceInfo, pickAudioFile, Reply, saveFileAs, shareFile } from '../engine/engine';
 import type { DeviceInfo, ProjectSummary } from '../engine/types';
 import { useApp } from '../state/AppState';
@@ -18,6 +18,7 @@ export function WelcomeScreen() {
   ];
   return (
     <ScrollView contentContainerStyle={s.welcome}>
+      <Image source={require('../assets/logo.png')} style={s.logoImage} accessibilityIgnoresInvertColors />
       <Text style={s.logo}>VoxMix <Text style={{ color: colors.purple }}>Pro</Text></Text>
       <Text style={s.tagline}>RECORD · MIX · MASTER</Text>
       <Text style={s.sub}>Your studio. In your pocket.</Text>
@@ -109,7 +110,10 @@ export function HomeScreen() {
   return (
     <View style={{ flex: 1 }}>
       <View style={[s.homeHeader]}>
-        <Text style={s.brand}>VoxMix <Text style={{ color: colors.purple }}>Pro</Text></Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.md }}>
+          <Image source={require('../assets/logo.png')} style={{ width: 40, height: 40, borderRadius: 10 }} />
+          <Text style={s.brand}>VoxMix <Text style={{ color: colors.purple }}>Pro</Text></Text>
+        </View>
       </View>
       <FlatList
         data={projects ?? []}
@@ -279,7 +283,8 @@ export function AppSettingsScreen() {
 }
 
 const s = StyleSheet.create({
-  welcome: { padding: space.xl, paddingTop: 60, flexGrow: 1 },
+  welcome: { padding: space.xl, paddingTop: 40, flexGrow: 1 },
+  logoImage: { width: 112, height: 112, borderRadius: 28, alignSelf: 'center', marginBottom: space.lg },
   logo: { color: colors.text, fontSize: 44, fontWeight: '800', textAlign: 'center' },
   tagline: { color: colors.textDim, letterSpacing: 4, textAlign: 'center', marginTop: space.sm },
   sub: { color: colors.textDim, textAlign: 'center', marginTop: space.sm, fontSize: font.md },

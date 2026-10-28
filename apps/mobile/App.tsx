@@ -7,7 +7,7 @@ import { StatusBar, StyleSheet, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { cmd } from './src/engine/engine';
 import { AppProvider, Route, useApp } from './src/state/AppState';
-import { EffectsScreen } from './src/screens/EffectsScreen';
+import { EffectEditorScreen, EffectsScreen } from './src/screens/EffectsScreen';
 import { AppSettingsScreen, HomeScreen, LibraryScreen, WelcomeScreen } from './src/screens/HomeScreens';
 import { ExportScreen, LayersScreen, MasteringScreen, ProjectSettingsScreen } from './src/screens/MixScreens';
 import { StudioScreen } from './src/screens/StudioScreen';
@@ -23,6 +23,7 @@ function Router() {
     case 'studio': return <StudioScreen />;
     case 'layers': return <LayersScreen />;
     case 'effects': return <EffectsScreen key={route.target} target={route.target} />;
+    case 'effectEditor': return <EffectEditorScreen key={route.slotId} target={route.target} slotId={route.slotId} />;
     case 'mastering': return <MasteringScreen />;
     case 'export': return <ExportScreen />;
     case 'projectSettings': return <ProjectSettingsScreen />;

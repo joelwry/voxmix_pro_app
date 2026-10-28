@@ -4,7 +4,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, PanResponder, PermissionsAndroid, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { cmd, formatTime, getDeviceInfo, pickAudioFile, useStatus } from '../engine/engine';
-import type { Clip, Project, Track } from '../engine/types';
+import NativeVoxEngine from '../native/NativeVoxEngine';
+import { barLoop } from '../ui/Transport';
+import type { Clip, Project, TakeHealth, Track } from '../engine/types';
+import { keyLabel } from '../engine/types';
 import { useApp } from '../state/AppState';
 import { Button, Field, Header, Icon, IconButton, LevelMeter, Sheet, Slider, Waveform } from '../ui/components';
 import { colors, font, radius, space } from '../ui/theme';
@@ -151,6 +154,35 @@ function RecordingRegion({ project, trackIndex, pps }: { project: Project; track
   return <View pointerEvents="none" style={[st.recRegion, { left, width, top: RULER_H + trackIndex * LANE_H + 4 }]} />;
 }
 
+/** Microphone level while the input is open: helps avoid clipping, the most common cause of
+    distorted ("crackly") vocals on phones. */
+function InputMeter() {
+  const peak = useStatus(s => Math.round((s.input?.peak ?? 0) * 50) / 50, 0);
+  const [hold, setHold] = useState(0);
+  useEffect(() => {
+    if (peak > hold) setHold(peak);
+    const t = setTimeout(() => setHold(h => Math.max(0, h - 0.1)), 400);
+    return () => clearTimeout(t);
+  }, [peak]); // eslint-disable-line react-hooks/exhaustive-deps
+  const loud = hold >= 0.9;
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: space.lg, paddingBottom: 4 }} accessibilityLabel="Microphone level">
+      <Text style={{ color: colors.textFaint, fontSize: 10, width: 24 }}>MIC</Text>
+      <View style={{ flex: 1 }}><LevelMeter l={peak} r={peak} height={4} /></View>
+      <Text style={{ color: loud ? colors.record : colors.textFaint, fontSize: 10, width: 74, textAlign: 'right' }}>{loud ? 'Too loud!' : peak > 0.02 ? 'Level OK' : 'No signal'}</Text>
+    </View>
+  );
+}
+
+function LoopRegion({ project, pps }: { project: Project; pps: number }) {
+  if (!(project.loop.end > project.loop.start)) return null;
+  const r = project.sampleRate;
+  return (
+    <View pointerEvents="none" style={[st.loopRegion, { left: (project.loop.start / r) * pps, width: ((project.loop.end - project.loop.start) / r) * pps },
+      !project.loop.on && { opacity: 0.35 }]} />
+  );
+}
+
 //------------------------------------------------------------------------------------------ screen
 
 export function StudioScreen() {
@@ -159,6 +191,10 @@ export function StudioScreen() {
   const [selectedClip, setSelectedClip] = useState<string | null>(null);
   const [trackMenu, setTrackMenu] = useState<Track | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loopSheet, setLoopSheet] = useState(false);
+  const [layerSheet, setLayerSheet] = useState(false);
+  const [denoiseSheet, setDenoiseSheet] = useState(false);
+  const inputOpen = useStatus(s => !!s.input?.open, false);
   const playing = useStatus(s => s.playing, false);
   const recording = useStatus(s => s.recording, false);
   const deviceError = useStatus(s => s.deviceError ?? '', '');
@@ -168,7 +204,10 @@ export function StudioScreen() {
 
   useEffect(() => {
     // start the audio device (playback only until the first recording asks for the microphone)
-    run('startAudio', {}, { quiet: true }).then(r => { if (!r) toast('Audio output could not start. Check that no other app is using audio.', 'error'); });
+    // open the microphone straight away when permission was already given (live mic level);
+    // otherwise playback only until the first recording asks for it
+    PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO).catch(() => false).then(granted =>
+      run('startAudio', { input: !!granted }, { quiet: true }).then(r => { if (!r) toast('Audio output could not start. Check that no other app is using audio.', 'error'); }));
     getDeviceInfo().then(i => { if (i.bluetooth) toast('Bluetooth headphones add latency. For tight timing use wired headphones.', 'info'); }).catch(() => {});
   }, [run, toast]);
 
@@ -196,7 +235,14 @@ export function StudioScreen() {
   const barStep = Math.max(1, Math.ceil(40 / (barSec * pps)));
 
   const record = async () => {
-    if (recording) { setBusy(true); await run('stopRecording'); setBusy(false); return; }
+    if (recording) {
+      setBusy(true);
+      const r = await run<any>('stopRecording');
+      setBusy(false);
+      const h: TakeHealth | undefined = r?.health;
+      if (h?.clean) toast('Take recorded cleanly');
+      return;
+    }
     if (!selected) { toast('Add a vocal layer first', 'error'); return; }
     if (!(await ensureMicPermission())) {
       Alert.alert('Microphone needed', 'Recording needs microphone access. You can allow it in Android Settings → Apps → VoxMix Pro → Permissions.');
@@ -211,7 +257,7 @@ export function StudioScreen() {
     <View style={{ flex: 1 }}>
       <Header
         title={project.name}
-        subtitle={`${vocal.length} of 10 layers · ${project.bpm} BPM · ${project.sampleRate / 1000} kHz`}
+        subtitle={`${vocal.length}/10 layers · ${project.bpm} BPM${project.analysis.keyRoot >= 0 ? ` · ${keyLabel(project.analysis.keyRoot, project.analysis.keyMinor)}` : ''}`}
         onBack={async () => { await run('closeProject'); back(); }}
         right={
           <View style={st.row}>
@@ -231,12 +277,17 @@ export function StudioScreen() {
           onPress={busy ? undefined : record} style={[st.recBtn, recording && st.recBtnActive]}>
           {recording ? <Icon name="stop" size={20} /> : <Icon name="record" size={24} color={colors.text} />}
         </Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="Loop options" onPress={() => setLoopSheet(true)}
+          style={[st.loopChip, project.loop.on && { borderColor: colors.cyan, backgroundColor: '#164E63' }]}>
+          <Text style={{ color: project.loop.on ? colors.text : colors.textDim, fontSize: 12, fontWeight: '700' }}>{project.loop.on ? 'Loop on' : 'Loop'}</Text>
+        </Pressable>
         <View style={{ flex: 1, alignItems: 'flex-end' }}>
           <TimeDisplay rate={rate} />
           <Text style={st.recTarget} numberOfLines={1}>{recording ? 'Recording' : 'Record to'}: {selected?.name ?? '—'}</Text>
         </View>
       </View>
       <RecordingInfo rate={rate} />
+      {inputOpen ? <InputMeter /> : null}
 
       {/* timeline */}
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ flexDirection: 'row' }}>
@@ -272,7 +323,13 @@ export function StudioScreen() {
           scrollEventThrottle={32}
           onLayout={e => { viewW.current = e.nativeEvent.layout.width; }}>
           <View style={{ width: contentW, height: RULER_H + tracks.length * LANE_H + 8 }}>
-            <Pressable accessibilityLabel="Timeline ruler: tap to move the playhead" onPress={e => seekTo(e.nativeEvent.locationX)} style={st.ruler}>
+            <LoopRegion project={project} pps={pps} />
+            <Pressable accessibilityLabel="Timeline ruler: tap to move the playhead, long press to loop 4 bars"
+              onPress={e => seekTo(e.nativeEvent.locationX)}
+              onLongPress={e => {
+                const l = barLoop(project, (e.nativeEvent.locationX / pps) * rate, 4);
+                run('setLoop', { enabled: true, start: l.start, end: l.end }, { success: 'Looping 4 bars' });
+              }} style={st.ruler}>
               {Array.from({ length: Math.ceil(endSec / barSec / barStep) }, (_, i) => i * barStep).map(b => (
                 <View key={b} style={[st.tick, { left: b * barSec * pps }]}><Text style={st.tickText}>{b + 1}</Text></View>
               ))}
@@ -303,6 +360,8 @@ export function StudioScreen() {
           <View style={st.row}>
             <IconButton icon="split" label="Split at playhead" onPress={() => run('splitClip', { clipId: clipObj.c.id })} />
             <IconButton icon="copy" label="Duplicate clip" onPress={() => run('duplicateClip', { clipId: clipObj.c.id })} />
+            <Button small variant="secondary" title="Loop" onPress={() => run('setLoop', { enabled: true, start: clipObj.c.start, end: clipObj.c.start + clipObj.c.length }, { success: 'Looping this clip' })} />
+            <Button small variant="secondary" title="Clean noise" onPress={() => setDenoiseSheet(true)} />
             <IconButton icon="minus" label="Clip gain down 1 dB" onPress={() => run('setClipGain', { clipId: clipObj.c.id, gainDb: clipObj.c.gainDb - 1 })} />
             <IconButton icon="plus" label="Clip gain up 1 dB" onPress={() => run('setClipGain', { clipId: clipObj.c.id, gainDb: clipObj.c.gainDb + 1 })} />
             <IconButton icon="trash" label="Delete clip" onPress={() => {
@@ -323,12 +382,17 @@ export function StudioScreen() {
         <View style={st.row}>
           <IconButton icon="minus" label="Zoom out" onPress={() => setPps(p => Math.max(8, p / 1.5))} />
           <IconButton icon="plus" label="Zoom in" onPress={() => setPps(p => Math.min(240, p * 1.5))} />
-          <Button small title="+ Layer" variant="secondary" disabled={vocal.length >= 10 || recording}
-            onPress={async () => { const r = await run<any>('addTrack'); if (r?.trackId) selectTrack(r.trackId); }} />
+          <Button small title="+ Layer" variant="secondary" disabled={vocal.length >= 10 || recording} onPress={() => setLayerSheet(true)} />
           <Button small title="Beat" variant="secondary" disabled={recording} onPress={async () => {
             try {
               const f = await pickAudioFile();
-              if (f) { setBusy(true); await run('importAudio', { path: f.path, name: f.name }, { success: `Imported ${f.name}` }); setBusy(false); }
+              if (f) {
+                setBusy(true);
+                toast(`Importing ${f.name} and detecting tempo and key…`);
+                const r = await run<any>('importAudio', { path: f.path, name: f.name });
+                setBusy(false);
+                if (r) toast(r.analysis?.bpm ? `Detected ${r.analysis.bpm} BPM${r.analysis.key ? ` · ${r.analysis.key}` : ''}${r.analysis.tempoApplied ? '' : ' (tempo not applied: low confidence)'}` : `Imported ${f.name}`);
+              }
             } catch (e: any) { toast(e.message, 'error'); setBusy(false); }
           }} />
         </View>
@@ -345,13 +409,81 @@ export function StudioScreen() {
       </View>
 
       <TrackSheet track={trackMenu} onClose={() => setTrackMenu(null)} />
+
+      <Sheet visible={loopSheet} onClose={() => setLoopSheet(false)} title="Loop">
+        <Text style={st.label}>Loop a section to hear effects while you adjust them. Long-press the ruler to loop 4 bars there.</Text>
+        <View style={{ gap: space.sm, marginTop: space.md }}>
+          {[4, 8].map(b => (
+            <Button key={b} variant="secondary" title={`Loop ${b} bars from the playhead`} onPress={async () => {
+              const pos = JSON.parse(NativeVoxEngine.getStatus()).position ?? 0;
+              const l = barLoop(project, pos, b);
+              await run('setLoop', { enabled: true, start: l.start, end: l.end });
+              setLoopSheet(false);
+            }} />
+          ))}
+          {clipObj ? <Button variant="secondary" title="Loop the selected clip" onPress={async () => { await run('setLoop', { enabled: true, start: clipObj.c.start, end: clipObj.c.start + clipObj.c.length }); setLoopSheet(false); }} /> : null}
+          <Button variant="secondary" title="Set loop start at playhead" onPress={async () => {
+            const pos = JSON.parse(NativeVoxEngine.getStatus()).position ?? 0;
+            const end = project.loop.end > pos ? project.loop.end : pos + barSec * rate * 4;
+            await run('setLoop', { enabled: true, start: pos, end });
+          }} />
+          <Button variant="secondary" title="Set loop end at playhead" onPress={async () => {
+            const pos = JSON.parse(NativeVoxEngine.getStatus()).position ?? 0;
+            await run('setLoop', { enabled: true, start: Math.min(project.loop.start, pos - rate), end: pos });
+          }} />
+          {project.loop.end > project.loop.start ? (
+            <Button variant={project.loop.on ? 'danger' : 'primary'} title={project.loop.on ? 'Turn loop off' : 'Turn loop on'}
+              onPress={async () => { await run('setLoop', { enabled: !project.loop.on }); setLoopSheet(false); }} />
+          ) : null}
+        </View>
+      </Sheet>
+
+      <Sheet visible={layerSheet} onClose={() => setLayerSheet(false)} title="Add a layer">
+        <View style={{ gap: space.sm }}>
+          <Button title="New empty layer (record into it)" onPress={async () => {
+            const r = await run<any>('addTrack');
+            if (r?.trackId) selectTrack(r.trackId);
+            setLayerSheet(false);
+          }} />
+          <Button variant="secondary" title="Import a vocal file as a new layer" onPress={async () => {
+            setLayerSheet(false);
+            try {
+              const f = await pickAudioFile();
+              if (!f) return;
+              setBusy(true);
+              const r = await run<any>('importAudio', { path: f.path, name: f.name, newLayer: true, start: 0 }, { success: `Imported ${f.name} as a new layer` });
+              setBusy(false);
+              if (r?.trackId) selectTrack(r.trackId);
+            } catch (e: any) { setBusy(false); toast(e.message, 'error'); }
+          }} />
+          <Text style={st.label}>WAV, MP3, M4A/AAC, FLAC and OGG files are supported. Imported vocals start at the beginning of the song; drag the clip to move it.</Text>
+        </View>
+      </Sheet>
+
+      <Sheet visible={denoiseSheet} onClose={() => setDenoiseSheet(false)} title="Clean up noise">
+        <Text style={st.label}>
+          Removes steady background noise (hiss, fan, room hum) from this clip. The noise is learned from the quiet parts between your
+          phrases. Your original recording is kept: Undo brings it back.
+        </Text>
+        <View style={{ gap: space.sm, marginTop: space.md }}>
+          {[['Light', 8], ['Medium', 14], ['Strong', 20]].map(([label, db]) => (
+            <Button key={label as string} variant="secondary" busy={busy} title={`${label} (${db} dB)`} onPress={async () => {
+              if (!clipObj) return;
+              setBusy(true);
+              const r = await run('denoiseClip', { clipId: clipObj.c.id, reductionDb: db }, { success: 'Noise cleaned up' });
+              setBusy(false);
+              if (r) { setDenoiseSheet(false); setSelectedClip(null); }
+            }} />
+          ))}
+        </View>
+      </Sheet>
     </View>
   );
 }
 
 /** Per-layer controls: volume, pan, rename shortcut, FX, duplicate, delete. */
 export function TrackSheet({ track, onClose }: { track: Track | null; onClose: () => void }) {
-  const { run, navigate, project } = useApp();
+  const { run, navigate, project, toast } = useApp();
   const live = project?.tracks.find(t => t.id === track?.id) ?? track;
   const [vol, setVol] = useState(0);
   const [pan, setPan] = useState(0);
@@ -398,6 +530,17 @@ export function TrackSheet({ track, onClose }: { track: Track | null; onClose: (
       ) : null}
       <View style={{ gap: space.sm, marginTop: space.lg }}>
         <Button title={`Layer FX (${live.fx.length})`} onPress={() => { onClose(); navigate({ name: 'effects', target: `track:${live.id}` }); }} />
+        {live.kind === 'vocal' ? (
+          <Button title="Import audio into this layer" variant="secondary" onPress={async () => {
+            onClose();
+            try {
+              const f = await pickAudioFile();
+              if (!f) return;
+              const pos = JSON.parse(NativeVoxEngine.getStatus()).position ?? 0;
+              await run('importAudio', { path: f.path, name: f.name, trackId: live.id, start: pos }, { success: `Imported ${f.name} at the playhead` });
+            } catch (e: any) { toast(e.message, 'error'); }
+          }} />
+        ) : null}
         <Button title="Duplicate layer" variant="secondary" disabled={live.kind === 'vocal' && vocals >= 10}
           onPress={async () => { await run('duplicateTrack', { trackId: live.id }); onClose(); }} />
         <Button title="Delete layer" variant="danger" onPress={() => Alert.alert('Delete layer?', `“${live.name}” is removed from the project. Its recordings stay in the project folder and you can undo.`, [
@@ -432,6 +575,8 @@ const st = StyleSheet.create({
   clip: { position: 'absolute', top: 3, height: LANE_H - 6, borderRadius: 6, borderWidth: 1, overflow: 'visible' },
   clipGain: { position: 'absolute', right: 4, top: 2, color: colors.text, fontSize: 9 },
   handle: { position: 'absolute', top: 0, bottom: 0, width: 18, backgroundColor: 'rgba(255,255,255,0.35)', borderRadius: 4 },
+  loopRegion: { position: 'absolute', top: 0, height: RULER_H, backgroundColor: 'rgba(34,211,238,0.28)', borderLeftWidth: 2, borderRightWidth: 2, borderColor: colors.cyan },
+  loopChip: { paddingHorizontal: 10, minHeight: 34, borderRadius: 17, borderWidth: 1, borderColor: colors.border, justifyContent: 'center', backgroundColor: colors.panel },
   playhead: { position: 'absolute', top: 0, bottom: 0, width: 2, backgroundColor: colors.text },
   recRegion: { position: 'absolute', height: LANE_H - 8, backgroundColor: 'rgba(244,63,94,0.35)', borderRadius: 6, borderWidth: 1, borderColor: colors.record },
   clipBar: { backgroundColor: colors.panelHigh, paddingHorizontal: space.md, paddingTop: space.xs, borderTopWidth: 1, borderColor: colors.border },
