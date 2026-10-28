@@ -35,6 +35,9 @@ const EffectDescriptor& vocalSweetDescriptor()
             p.def = def.def;
             p.unit = def.unit;
             p.logScale = def.centre > 0.0f && def.unit == std::string ("Hz");
+            const std::string g = def.group;
+            p.group = g == "MACRO" ? "Quick" : (g == "HPF" || g == "EQ") ? "EQ" : g == "COMP" ? "Compressor"
+                    : g == "DEESS" ? "De-Ess" : (g == "SAT" || g == "EXCITE") ? "Color" : g == "DOUBLE" ? "Doubler" : "Output";
             switch (def.kind)
             {
                 case vs::ParamKind::Float:  p.type = ParamType::Continuous; break;
@@ -43,6 +46,7 @@ const EffectDescriptor& vocalSweetDescriptor()
             }
             e.params.push_back (p);
         }
+        std::stable_partition (e.params.begin(), e.params.end(), [] (const ParamInfo& p) { return p.group == "Quick"; });
         return e;
     }();
     return d;
@@ -103,6 +107,13 @@ private:
 void registerVocalSweet (std::vector<EffectType>& out)
 {
     out.push_back ({ &vocalSweetDescriptor(), [] { return std::make_shared<VocalSweetEffect>(); } });
+}
+
+std::vector<std::string> vocalSweetPresetNames()
+{
+    std::vector<std::string> names;
+    for (const auto& p : vs::factoryPresets()) names.push_back (p.name);
+    return names;
 }
 
 /** Factory presets of the VocalSweet plugin, exposed so preset chains can reuse them. */

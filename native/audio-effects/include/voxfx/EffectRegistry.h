@@ -39,5 +39,6 @@ void registerMastering (std::vector<EffectType>&);         // mastering chain
 /** Parameter values of a VocalSweet factory preset ("Afrobeat Lead", ...) for the
     "vocal_sweetener" effect. Returns false for an unknown name. */
 bool vocalSweetPresetValues (const std::string& presetName, std::vector<std::pair<std::string, float>>& out);
+std::vector<std::string> vocalSweetPresetNames();
 
 } // namespace voxfx

@@ -37,6 +37,7 @@ struct ParamInfo
     std::string unit;
     bool logScale = false;              // UI hint: slider uses a logarithmic mapping
     std::vector<std::string> choices;   // for Choice
+    std::string group;                  // UI page ("Quick", "EQ", "Dynamics" ...); empty = "Main"
 };
 
 enum class EffectCategory
@@ -104,5 +105,9 @@ private:
 };
 
 using EffectPtr = std::shared_ptr<Effect>;
+
+/** UI page of a parameter: its own group, or a page chosen for the effect type ("Main" otherwise).
+    Pages keep editors short enough to fit on a phone screen without scrolling. */
+std::string paramGroup (const EffectDescriptor& d, const ParamInfo& p);
 
 } // namespace voxfx

@@ -111,6 +111,23 @@ struct Project
     int timeSigNum = 4, timeSigDen = 4;
     int64_t recordOffsetFrames = 0;          // user latency trim added to automatic compensation
     bool inputMonitoring = false;
+    std::string micMode = "raw";             // "raw" (no phone processing), "voice", "auto" (AGC), "clean" (noise suppression)
+    std::string latencyMode = "balanced";    // "lowest", "balanced", "safe": output buffer size while recording
+    bool inputLowCut = true;                 // 40 Hz high-pass on the microphone (removes rumble and DC)
+    bool loopOn = false;
+    int64_t loopStart = 0, loopEnd = 0;      // frames
+    struct Analysis
+    {
+        bool done = false;
+        std::string sourceId;                // analysed beat
+        double bpm = 0.0;
+        float bpmConfidence = 0.0f;
+        int keyRoot = -1;                    // 0 = C .. 11 = B
+        bool keyMinor = false;
+        float keyConfidence = 0.0f;
+        int altKeyRoot = -1;
+        bool altKeyMinor = false;
+    } analysis;
     std::vector<SourceSpec> sources;
     std::vector<TrackSpec> tracks;
     std::vector<BusSpec> buses;

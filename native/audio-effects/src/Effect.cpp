@@ -1,6 +1,7 @@
 #include "voxfx/EffectRegistry.h"
 #include <algorithm>
 #include <cmath>
+#include <map>
 
 namespace voxfx
 {
@@ -55,6 +56,36 @@ float Effect::getParam (int index) const noexcept
     if (index < 0 || index >= numParams())
         return 0.0f;
     return values[(size_t) index].load (std::memory_order_relaxed);
+}
+
+std::string paramGroup (const EffectDescriptor& d, const ParamInfo& p)
+{
+    if (! p.group.empty()) return p.group;
+    static const std::map<std::string, std::map<std::string, std::string>> table = {
+        { "eq", { { "hpfOn", "Low" }, { "hpfFreq", "Low" }, { "lowFreq", "Low" }, { "lowGain", "Low" },
+                  { "mid1Freq", "Mids" }, { "mid1Gain", "Mids" }, { "mid1Q", "Mids" }, { "mid2Freq", "Mids" }, { "mid2Gain", "Mids" }, { "mid2Q", "Mids" },
+                  { "highFreq", "High" }, { "highGain", "High" }, { "output", "High" } } },
+        { "compressor", { { "threshold", "Main" }, { "ratio", "Main" }, { "makeup", "Main" }, { "autoMakeup", "Main" }, { "mix", "Main" },
+                          { "attack", "Timing" }, { "release", "Timing" }, { "knee", "Timing" } } },
+        { "reverb", { { "type", "Main" }, { "decay", "Main" }, { "mix", "Main" }, { "width", "Main" },
+                      { "predelay", "Tone" }, { "damping", "Tone" }, { "lowCut", "Tone" } } },
+        { "delay", { { "sync", "Time" }, { "division", "Time" }, { "time", "Time" }, { "pingPong", "Time" },
+                     { "feedback", "Main" }, { "mix", "Main" }, { "lowCut", "Main" }, { "highCut", "Main" } } },
+        { "pitch_correction", { { "key", "Key" }, { "scale", "Key" }, { "reference", "Key" },
+                                { "speed", "Tune" }, { "strength", "Tune" }, { "humanize", "Tune" }, { "mix", "Tune" } } },
+        { "mastering", { { "inputGain", "Tone" }, { "eqOn", "Tone" }, { "lowGain", "Tone" }, { "midFreq", "Tone" }, { "midGain", "Tone" }, { "highGain", "Tone" },
+                         { "compOn", "Glue" }, { "compThreshold", "Glue" }, { "compRatio", "Glue" }, { "compAttack", "Glue" }, { "compRelease", "Glue" },
+                         { "width", "Finish" }, { "limiterOn", "Finish" }, { "ceiling", "Finish" } } },
+    };
+    if (auto t = table.find (d.typeId); t != table.end())
+        if (auto g = t->second.find (p.id); g != t->second.end()) return g->second;
+    if (d.typeId.rfind ("ms_", 0) == 0)   // MoodShift FX: 5 macros, then the effect's own controls
+    {
+        static const char* macros[] = { "amount", "mix", "tone", "movement", "width" };
+        for (auto* m : macros) if (p.id == m) return "Main";
+        return "Advanced";
+    }
+    return "Main";
 }
 
 //==============================================================================

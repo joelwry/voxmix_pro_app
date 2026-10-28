@@ -230,7 +230,15 @@ class VoxEngineModule(private val context: ReactApplicationContext) :
                         if (input == null) throw IllegalStateException("The file could not be read")
                         dst.outputStream().use { input.copyTo(it, 1 shl 16) }
                     }
-                    p.resolve(JSONObject().put("path", dst.absolutePath).put("name", name).put("size", dst.length()).toString())
+                    // M4A/AAC/OGG/FLAC/...: decode with the phone's codecs into WAV for the engine
+                    var path = dst
+                    if (AudioDecoder.needsConversion(dst)) {
+                        val wav = File(dir, dst.nameWithoutExtension + ".decoded.wav")
+                        AudioDecoder.decodeToWav(dst, wav)
+                        dst.delete()
+                        path = wav
+                    }
+                    p.resolve(JSONObject().put("path", path.absolutePath).put("name", name).put("size", path.length()).toString())
                 } catch (e: Exception) {
                     p.reject("E_IMPORT", e.message ?: "The file could not be read", e)
                 }

@@ -73,28 +73,68 @@ std::vector<float> channel (const vox::DecodedAudio& d, int ch)
 
 /** Drives the engine like a full-duplex device whose microphone hears the speaker output
     `latency` frames later (acoustic loopback with a known round trip). */
+/** A device whose input and output share one clock: the microphone hears output frame j as
+    input frame j + latency. It reports exact round-trip latency from the stream counters, the
+    way OboeDevice does from hardware timestamps. The test drives the callbacks itself. */
+struct SimDevice final : vox::IAudioDevice
+{
+    int latency = 0;
+    bool running = false, input = false;
+    bool start (int, bool withInput, vox::AudioCallback*, std::string&) override { running = true; input = withInput; return true; }
+    void stop() override { running = false; }
+    vox::DeviceStatus status() override
+    {
+        vox::DeviceStatus st;
+        st.running = running;
+        st.inputOpen = input;
+        st.sampleRate = kSr;
+        st.outputLatencyFrames = latency / 2;
+        st.inputLatencyFrames = latency - latency / 2;
+        return st;
+    }
+    bool roundTripLatency (const vox::StreamClock& c, double& frames) override
+    {
+        if (! c.valid) return false;
+        frames = double (latency) + double (c.outFramesWritten - c.inFramesRead);
+        return true;
+    }
+};
+
 struct LoopbackDriver
 {
     Engine& engine;
     int latency;
     int block = 192;
+    bool jitter = false;          // mic delivers 0 frames, then 2 blocks (real full-duplex behaviour)
     std::vector<float> history;   // everything the engine has output (mono L)
-    int64_t frame = 0;
+    int64_t frame = 0;            // output frames so far (= ADC frames produced)
+    int64_t micRead = 0;          // mic frames delivered to the engine
+    int64_t callbacksRun = 0;
 
     void run (double seconds, float micGain = 1.0f)
     {
         const int64_t total = (int64_t) (seconds * kSr);
-        std::vector<float> in ((size_t) block), out ((size_t) block * 2);
+        std::vector<float> in ((size_t) block * 4), out ((size_t) block * 2);
         for (int64_t done = 0; done < total; done += block)
         {
-            for (int i = 0; i < block; ++i)
+            int64_t want = block;
+            if (jitter) want = (callbacksRun % 2 == 0) ? 0 : 2 * block;
+            const int64_t avail = frame + block - micRead;   // the ADC runs in step with the DAC
+            const int n = (int) std::max<int64_t> (0, std::min (want, avail));
+            for (int i = 0; i < n; ++i)
             {
-                const int64_t src = frame + i - latency;
+                const int64_t src = micRead + i - latency;
                 in[(size_t) i] = src >= 0 && src < (int64_t) history.size() ? micGain * history[(size_t) src] : 0.0f;
             }
-            engine.onAudio (in.data(), 1, block, out.data(), block);
+            vox::StreamClock clk;
+            clk.valid = true;
+            clk.outFramesWritten = frame;
+            clk.inFramesRead = micRead;
+            engine.onAudio (in.data(), 1, n, out.data(), block, clk);
+            micRead += n;
             for (int i = 0; i < block; ++i) history.push_back (out[(size_t) (2 * i)]);
             frame += block;
+            ++callbacksRun;
         }
     }
 };
@@ -697,4 +737,285 @@ TEST (Calibration_MeasuresLoopbackRoundTrip)
     mustCall (e, "startLatencyTest");
     drv.run (4.5, 0.0f);
     CHECK (! call (e, "finishLatencyTest")["ok"].get<bool>());
+}
+
+TEST (Recording_JitteryInputIsCapturedWithoutGapsOrDrift)
+{
+    // Real Android full-duplex streams deliver microphone frames unevenly (0 frames in one
+    // callback, a double block in the next). Takes must contain every frame exactly once:
+    // no inserted silence (crackle) and no drift (sync).
+    const auto dir = th::tempDir ("jitter");
+    auto dev = std::make_unique<SimDevice>();
+    dev->latency = 1000;
+    Engine e (dir, std::move (dev));
+    mustCall (e, "createProject");
+    auto clicksMono = th::clicks (kSr * 5, 4800, 24000);
+    std::vector<float> st (clicksMono.size() * 2);
+    for (size_t i = 0; i < clicksMono.size(); ++i) st[2 * i] = st[2 * i + 1] = clicksMono[i];
+    // add a continuous tone so any gap in the take is detectable
+    for (size_t i = 0; i < clicksMono.size(); ++i) { const float t = 0.2f * (float) std::sin (2 * th::kPi * 220.0 * i / kSr); st[2 * i] += t; st[2 * i + 1] += t; }
+    CHECK (th::writeWav (dir + "/beat.wav", st, 2, kSr, 32));
+    auto r = mustCall (e, "importAudio", { { "path", dir + "/beat.wav" }, { "analyze", false } });
+    const std::string lead = trackIdByName (r["project"], "Lead Vocal");
+    const std::string beat = beatTrack (r["project"]);
+    LoopbackDriver drv { e, 1000 };
+    drv.jitter = true;
+    drv.run (0.1);
+    mustCall (e, "seek", { { "frame", 0 } });
+    drv.run (0.01);   // the device is running: the seek lands at the next callback
+    mustCall (e, "startRecording", { { "trackId", lead } });
+    drv.run (4.0);
+    auto stop = mustCall (e, "stopRecording");
+    CHECK (stop["health"]["droppedFrames"].get<int64_t>() == 0);
+    // every delivered frame is in the take, and nothing else
+    const int64_t recorded = stop["clip"]["recordedFrames"].get<int64_t>();
+    CHECK_MSG (std::abs (recorded - 4 * kSr) <= 2 * drv.block, "recorded " + std::to_string (recorded));
+    mustCall (e, "updateTrack", { { "trackId", beat }, { "mute", true } });
+    auto d = exportAndDecode (e, dir + "/take.wav");
+    auto L = channel (d, 0);
+    for (int expected = 28800 + 4800 * 0; expected < 3 * kSr; expected += 24000)
+    {
+        const int ref = th::onset (clicksMono, expected - 5, 0.05f);
+        // find the click above the tone: the click raises the level well above 0.2
+        int got = -1;
+        for (int i = expected - 2000; i < expected + 2000; ++i) if (std::abs (L[(size_t) i]) > 0.5f) { got = i; break; }
+        CHECK_MSG (std::abs (got - ref) <= 3, "click expected near " + std::to_string (ref) + " got " + std::to_string (got));
+    }
+    // no silent holes in the continuous tone (a padded block would leave >= 96 near-zero samples)
+    int longestQuiet = 0, run = 0;
+    for (int i = kSr / 2; i < 3 * kSr; ++i) { run = std::abs (L[(size_t) i]) < 1e-4f ? run + 1 : 0; longestQuiet = std::max (longestQuiet, run); }
+    CHECK_MSG (longestQuiet < 16, "longest silent run " + std::to_string (longestQuiet));
+}
+
+TEST (Monitoring_IsContinuousWithJitteryInput)
+{
+    const auto dir = th::tempDir ("monitor");
+    Engine e (dir, nullptr);
+    auto r = mustCall (e, "createProject");
+    const std::string lead = trackIdByName (r["project"], "Lead Vocal");
+    mustCall (e, "setMonitoring", { { "enabled", true } });
+    mustCall (e, "startRecording", { { "trackId", lead } });
+    // feed a sine as "voice" through jittery deliveries and check the speaker output stays continuous
+    const int block = 192;
+    std::vector<float> in ((size_t) block * 4), out ((size_t) block * 2), heard;
+    int64_t micPos = 0;
+    for (int cb = 0; cb < 400; ++cb)
+    {
+        const int n = cb % 2 == 0 ? 0 : 2 * block;
+        for (int i = 0; i < n; ++i) in[(size_t) i] = 0.3f * (float) std::sin (2 * th::kPi * 440.0 * (micPos + i) / kSr);
+        micPos += n;
+        vox::StreamClock clk;
+        e.onAudio (in.data(), 1, n, out.data(), block, clk);
+        for (int i = 0; i < block; ++i) heard.push_back (out[(size_t) (2 * i)]);
+    }
+    mustCall (e, "stopRecording");
+    // after priming, the monitored sine must never drop to silence for a block
+    int worst = 0, run = 0;
+    for (size_t i = (size_t) kSr / 10; i < heard.size(); ++i) { run = std::abs (heard[i]) < 1e-4f ? run + 1 : 0; worst = std::max (worst, run); }
+    CHECK_MSG (worst < 8, "monitor gap of " + std::to_string (worst) + " samples");
+}
+
+TEST (Transport_LoopRegionRepeats)
+{
+    const auto dir = th::tempDir ("loop");
+    Engine e (dir, nullptr);
+    mustCall (e, "createProject");
+    auto v = th::noise (kSr * 4, 0.2f, 3);
+    CHECK (th::writeWav (dir + "/b.wav", v, 1, kSr));
+    mustCall (e, "importAudio", { { "path", dir + "/b.wav" }, { "analyze", false } });
+    CHECK (! call (e, "setLoop", { { "enabled", true }, { "startSeconds", 1.0 }, { "endSeconds", 1.1 } })["ok"].get<bool>());
+    mustCall (e, "setLoop", { { "enabled", true }, { "startSeconds", 1.0 }, { "endSeconds", 2.0 } });
+    mustCall (e, "play");
+    LoopbackDriver drv { e, 0 };
+    drv.run (3.5);
+    const int64_t pos = e.transportPosition();
+    CHECK_MSG (pos >= kSr && pos < 2 * kSr, "position " + std::to_string (pos));
+    // the second pass through the loop sounds like the first (away from the 2 ms boundary fades)
+    const auto& h = drv.history;
+    double diff = 0, ref = 0;
+    for (int i = 1000; i < kSr - 1000; ++i) { diff += std::abs (h[(size_t) i] - h[(size_t) (i + kSr)]); ref += std::abs (h[(size_t) i]); }
+    CHECK (diff < ref * 1e-3);
+    // the project remembers the loop
+    auto p = mustCall (e, "getProject")["project"];
+    CHECK (p["loop"]["on"].get<bool>());
+    CHECK (p["loop"]["start"].get<int64_t>() == kSr);
+    mustCall (e, "setLoop", { { "enabled", false } });
+    CHECK (! mustCall (e, "getProject")["project"]["loop"]["on"].get<bool>());
+}
+
+TEST (Import_VocalAsNewLayer)
+{
+    const auto dir = th::tempDir ("implayer");
+    Engine e (dir, nullptr);
+    mustCall (e, "createProject");
+    auto v = th::sine (300, kSr, kSr * 2, 0.3f);
+    CHECK (th::writeWav (dir + "/My Harmony.wav", v, 1, kSr));
+    auto r = mustCall (e, "importAudio", { { "path", dir + "/My Harmony.wav" }, { "newLayer", true } });
+    const std::string id = r["trackId"];
+    bool found = false;
+    for (const auto& t : r["project"]["tracks"])
+        if (t["id"] == id)
+        {
+            found = true;
+            CHECK (t["kind"] == "vocal");
+            CHECK (t["name"] == "My Harmony");
+            CHECK (t["clips"].size() == 1);
+            CHECK (t["clips"][0]["start"].get<int64_t>() == 0);
+        }
+    CHECK (found);
+    CHECK (r["project"]["tracks"].size() == 2);   // the beat track is untouched / not created
+    for (int i = 0; i < 8; ++i) mustCall (e, "addTrack");
+    CHECK (! call (e, "importAudio", { { "path", dir + "/My Harmony.wav" }, { "newLayer", true } })["ok"].get<bool>());
+}
+
+TEST (Analysis_DetectsTempoAndKeyOfABeat)
+{
+    // synthetic beat: kick on every beat at 100 BPM, hats on 8ths, A minor chords (Am-F-C-G style
+    // emphasis on A, C, E) with an A bass
+    const auto dir = th::tempDir ("analysis");
+    const double bpm = 100.0;
+    const int n = kSr * 30;
+    std::vector<float> mono ((size_t) n, 0.0f);
+    const double beatLen = 60.0 / bpm * kSr;
+    for (int b = 0; b * beatLen < n; ++b)
+    {
+        const int s0 = (int) (b * beatLen);
+        for (int i = 0; i < 4000 && s0 + i < n; ++i)   // kick: decaying 60 Hz sine
+            mono[(size_t) (s0 + i)] += 0.8f * (float) (std::exp (-i / 900.0) * std::sin (2 * th::kPi * 60.0 * i / kSr));
+        const int h = (int) (s0 + beatLen / 2);
+        std::mt19937 rng (b);
+        std::uniform_real_distribution<float> u (-1, 1);
+        for (int i = 0; i < 600 && h + i < n; ++i) mono[(size_t) (h + i)] += 0.15f * (float) std::exp (-i / 150.0) * u (rng);
+    }
+    const double notes[] = { 220.0, 261.63, 329.63, 110.0, 440.0 };   // A3 C4 E4 A2 A4
+    const float amps[] = { 0.12f, 0.10f, 0.10f, 0.14f, 0.06f };
+    for (int i = 0; i < n; ++i)
+        for (int k = 0; k < 5; ++k) mono[(size_t) i] += amps[k] * (float) std::sin (2 * th::kPi * notes[k] * i / kSr);
+    std::vector<float> st ((size_t) n * 2);
+    for (int i = 0; i < n; ++i) st[(size_t) (2 * i)] = st[(size_t) (2 * i + 1)] = mono[(size_t) i] * 0.6f;
+    CHECK (th::writeWav (dir + "/beat.wav", st, 2, kSr));
+
+    Engine e (dir, nullptr);
+    mustCall (e, "createProject", { { "bpm", 120 } });
+    auto r = mustCall (e, "importAudio", { { "path", dir + "/beat.wav" } });
+    const auto& an = r["analysis"];
+    CHECK_MSG (std::abs (an["bpm"].get<double>() - 100.0) <= 1.0, an.dump());
+    CHECK_MSG (an["key"] == "A minor" || an["altKey"] == "A minor", an.dump());
+    CHECK (an["tempoApplied"].get<bool>());
+    CHECK_NEAR (r["project"]["bpm"].get<double>(), 100.0, 1.0);
+    CHECK (r["project"]["analysis"]["done"].get<bool>());
+
+    // new pitch correction starts in the detected key; the key can be applied to all instances
+    auto p = mustCall (e, "getProject")["project"];
+    const std::string lead = trackIdByName (p, "Lead Vocal");
+    mustCall (e, "setKey", { { "root", 9 }, { "minor", true } });
+    auto added = mustCall (e, "addEffect", { { "target", "track:" + lead }, { "type", "pitch_correction" } });
+    for (const auto& t : added["project"]["tracks"])
+        if (t["id"] == lead)
+        {
+            CHECK_NEAR (t["fx"][0]["params"]["key"].get<float>(), 9.0f, 1e-6);
+            CHECK_NEAR (t["fx"][0]["params"]["scale"].get<float>(), 2.0f, 1e-6);   // Minor
+        }
+    mustCall (e, "setKey", { { "root", 2 }, { "minor", false } });
+    auto ap = mustCall (e, "applyKeyToPitchCorrection");
+    CHECK (ap["changed"].get<int>() == 1);
+}
+
+TEST (Denoise_ReducesNoiseKeepsVoice)
+{
+    const auto dir = th::tempDir ("denoise");
+    Engine e (dir, nullptr);
+    auto r = mustCall (e, "createProject");
+    const std::string lead = trackIdByName (r["project"], "Lead Vocal");
+    // "phrases": 1 s tone bursts with 0.7 s pauses, plus steady hiss at -40 dBFS
+    const int n = kSr * 8;
+    std::vector<float> v ((size_t) n), clean ((size_t) n, 0.0f);
+    std::mt19937 rng (5);
+    std::normal_distribution<float> g (0.0f, 0.01f);
+    for (int i = 0; i < n; ++i)
+    {
+        const bool voiced = (i % (int) (1.7 * kSr)) < kSr;
+        clean[(size_t) i] = voiced ? 0.3f * (float) std::sin (2 * th::kPi * 300.0 * i / kSr) : 0.0f;
+        v[(size_t) i] = clean[(size_t) i] + g (rng);
+    }
+    CHECK (th::writeWav (dir + "/noisy.wav", v, 1, kSr, 32));
+    auto imp = mustCall (e, "importAudio", { { "path", dir + "/noisy.wav" }, { "trackId", lead }, { "start", 0 } });
+    const std::string clip = imp["clipId"];
+    auto d0 = exportAndDecode (e, dir + "/before.wav");
+    mustCall (e, "denoiseClip", { { "clipId", clip }, { "reductionDb", 18 } });
+    auto d1 = exportAndDecode (e, dir + "/after.wav");
+    auto a = channel (d0, 0), b = channel (d1, 0);
+    auto rmsIn = [] (const std::vector<float>& x, int s, int len) { return th::rms (x.data() + s, len); };
+    // pause region (1.2 s .. 1.6 s) and voiced region (0.2 .. 0.8 s)
+    const int ps = (int) (1.2 * kSr), pl = (int) (0.4 * kSr), vs = (int) (0.2 * kSr), vl = (int) (0.6 * kSr);
+    const double noiseDrop = 20 * std::log10 (rmsIn (a, ps, pl) / std::max (1e-9, rmsIn (b, ps, pl)));
+    const double voiceChange = 20 * std::log10 (rmsIn (b, vs, vl) / rmsIn (a, vs, vl));
+    std::printf ("    denoise: noise -%.1f dB in pauses, voice %+.2f dB\n", noiseDrop, voiceChange);
+    CHECK (noiseDrop > 10.0);
+    CHECK (std::abs (voiceChange) < 1.0);
+    // undo returns to the original recording
+    mustCall (e, "undo");
+    auto p = mustCall (e, "getProject")["project"];
+    for (const auto& t : p["tracks"]) if (t["id"] == lead) CHECK (t["clips"][0]["sourceId"] == imp["sourceId"]);
+}
+
+TEST (Compare_BypassesDestinationWithoutSaving)
+{
+    const auto dir = th::tempDir ("compare");
+    Engine e (dir, nullptr);
+    auto r = mustCall (e, "createProject");
+    const std::string lead = trackIdByName (r["project"], "Lead Vocal");
+    std::vector<float> v (kSr, 0.0f);
+    for (int i = 0; i < kSr; ++i) v[(size_t) i] = 0.25f * (float) std::sin (2 * th::kPi * 500.0 * i / kSr);
+    CHECK (th::writeWav (dir + "/v.wav", v, 1, kSr, 32));
+    mustCall (e, "importAudio", { { "path", dir + "/v.wav" }, { "trackId", lead }, { "start", 0 } });
+    mustCall (e, "addEffect", { { "target", "track:" + lead }, { "type", "eq" }, { "params", { { "hpfOn", 0 }, { "output", -12 } } } });
+    auto render = [&] (const std::string& name)
+    {
+        mustCall (e, "seek", { { "frame", 0 } });
+        mustCall (e, "play");
+        LoopbackDriver drv { e, 0 };
+        drv.run (0.5);
+        mustCall (e, "pause");
+        return th::rms (drv.history.data() + kSr / 5, kSr / 4);
+        (void) name;
+    };
+    const double wet = render ("wet");
+    mustCall (e, "setCompare", { { "target", "track:" + lead }, { "enabled", true } });
+    LoopbackDriver settle { e, 0 };
+    settle.run (0.05);   // let the 10 ms bypass crossfade finish
+    const double dry = render ("dry");
+    CHECK_NEAR (20 * std::log10 (dry / wet), 12.0, 0.5);
+    mustCall (e, "setCompare", { { "enabled", false } });
+    auto p = mustCall (e, "getProject")["project"];
+    for (const auto& t : p["tracks"]) if (t["id"] == lead) CHECK (! t["fx"][0]["bypass"].get<bool>());   // nothing saved
+}
+
+TEST (Input_LowCutRemovesDcAndMetersInput)
+{
+    const auto dir = th::tempDir ("lowcut");
+    Engine e (dir, nullptr);
+    e.setAssumedRoundTripLatency (0);
+    auto r = mustCall (e, "createProject");
+    const std::string lead = trackIdByName (r["project"], "Lead Vocal");
+    mustCall (e, "startRecording", { { "trackId", lead } });
+    const int block = 192;
+    std::vector<float> in ((size_t) block, 0.0f), out ((size_t) block * 2);
+    for (int cb = 0; cb < 500; ++cb)
+    {
+        for (int i = 0; i < block; ++i) in[(size_t) i] = 0.2f + 0.1f * (float) std::sin (2 * th::kPi * 1000.0 * (cb * block + i) / kSr);   // DC offset + tone
+        vox::StreamClock clk;
+        e.onAudio (in.data(), 1, block, out.data(), block, clk);
+    }
+    auto st = json::parse (e.status());
+    CHECK_NEAR (st["input"]["peak"].get<float>(), 0.3f, 0.01f);
+    auto stop = mustCall (e, "stopRecording");
+    CHECK (stop["health"]["clean"].get<bool>());
+    auto d = exportAndDecode (e, dir + "/t.wav");
+    auto L = channel (d, 0);
+    double mean = 0;
+    for (int i = kSr; i < 2 * kSr; ++i) mean += L[(size_t) i];
+    mean /= kSr;
+    CHECK (std::abs (mean) < 0.002);   // DC removed, tone kept
+    CHECK (th::rms (L.data() + kSr, kSr) > 0.06);
 }

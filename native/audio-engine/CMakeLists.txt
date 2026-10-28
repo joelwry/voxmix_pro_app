@@ -1,5 +1,6 @@
 # voxengine: platform-independent real-time audio engine (no React Native, no Android code).
 add_library(voxengine STATIC
+    src/Analysis.cpp
     src/AudioSource.cpp
     src/Engine.cpp
     src/GraphBuilder.cpp

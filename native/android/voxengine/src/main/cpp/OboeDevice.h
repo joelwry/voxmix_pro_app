@@ -33,6 +33,8 @@ public:
     OboeDevice();
     ~OboeDevice() override;
 
+    void setOptions (const DeviceOptions& o) override;
+    bool roundTripLatency (const StreamClock& clock, double& frames) override;
     bool start (int sampleRate, bool withInput, AudioCallback* cb, std::string& error) override;
     void stop() override;
     DeviceStatus status() override;
@@ -57,6 +59,13 @@ private:
     std::atomic<int> outLatency { 0 }, inLatency { 0 };
     std::atomic<bool> measured { false };
     std::atomic<int> lastXruns { 0 };
+    DeviceOptions options;
+    int bufferBursts() const;
+
+    // latest hardware timestamps (frame position, CLOCK_MONOTONIC ns) from the monitor thread
+    std::mutex tsLock;
+    bool tsValid = false;
+    int64_t tsOutFrame = 0, tsOutTime = 0, tsInFrame = 0, tsInTime = 0;
 
     std::thread monitor;
     std::atomic<bool> monitorQuit { false };

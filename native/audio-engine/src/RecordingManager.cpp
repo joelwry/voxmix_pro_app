@@ -49,6 +49,7 @@ void RecordingManager::capture (const float* mono, int n, int64_t pos) noexcept
         capturing.store (false, std::memory_order_release);
         return;
     }
+    if (n <= 0) return;   // nothing delivered this callback: start (or continue) with the next frames
     if (! capturing.load (std::memory_order_relaxed))
     {
         startPos.store (pos, std::memory_order_relaxed);

@@ -86,6 +86,12 @@ std::string projectToJson (const Project& p, bool pretty)
     j["timeSignature"] = { p.timeSigNum, p.timeSigDen };
     j["recordOffsetFrames"] = p.recordOffsetFrames;
     j["inputMonitoring"] = p.inputMonitoring;
+    j["recording"] = { { "micMode", p.micMode }, { "latencyMode", p.latencyMode }, { "inputLowCut", p.inputLowCut } };
+    j["loop"] = { { "on", p.loopOn }, { "start", p.loopStart }, { "end", p.loopEnd } };
+    const auto& an = p.analysis;
+    j["analysis"] = { { "done", an.done }, { "sourceId", an.sourceId }, { "bpm", an.bpm }, { "bpmConfidence", an.bpmConfidence },
+                      { "keyRoot", an.keyRoot }, { "keyMinor", an.keyMinor }, { "keyConfidence", an.keyConfidence },
+                      { "altKeyRoot", an.altKeyRoot }, { "altKeyMinor", an.altKeyMinor } };
 
     json sources = json::array();
     for (const auto& s : p.sources)
@@ -152,6 +158,34 @@ bool projectFromJson (const std::string& text, Project& out, std::string& error,
     }
     p.recordOffsetFrames = get<int64_t> (j, "recordOffsetFrames", 0);
     p.inputMonitoring = get<bool> (j, "inputMonitoring", false);
+    if (auto it = j.find ("recording"); it != j.end() && it->is_object())
+    {
+        p.micMode = get<std::string> (*it, "micMode", "raw");
+        if (p.micMode != "raw" && p.micMode != "voice" && p.micMode != "auto" && p.micMode != "clean") p.micMode = "raw";
+        p.latencyMode = get<std::string> (*it, "latencyMode", "balanced");
+        if (p.latencyMode != "lowest" && p.latencyMode != "balanced" && p.latencyMode != "safe") p.latencyMode = "balanced";
+        p.inputLowCut = get<bool> (*it, "inputLowCut", true);
+    }
+    if (auto it = j.find ("loop"); it != j.end() && it->is_object())
+    {
+        p.loopOn = get<bool> (*it, "on", false);
+        p.loopStart = std::max<int64_t> (0, get<int64_t> (*it, "start", 0));
+        p.loopEnd = std::max<int64_t> (0, get<int64_t> (*it, "end", 0));
+        if (p.loopEnd <= p.loopStart) p.loopOn = false;
+    }
+    if (auto it = j.find ("analysis"); it != j.end() && it->is_object())
+    {
+        auto& an = p.analysis;
+        an.done = get<bool> (*it, "done", false);
+        an.sourceId = get<std::string> (*it, "sourceId", "");
+        an.bpm = get<double> (*it, "bpm", 0.0);
+        an.bpmConfidence = get<float> (*it, "bpmConfidence", 0.0f);
+        an.keyRoot = std::clamp (get<int> (*it, "keyRoot", -1), -1, 11);
+        an.keyMinor = get<bool> (*it, "keyMinor", false);
+        an.keyConfidence = get<float> (*it, "keyConfidence", 0.0f);
+        an.altKeyRoot = std::clamp (get<int> (*it, "altKeyRoot", -1), -1, 11);
+        an.altKeyMinor = get<bool> (*it, "altKeyMinor", false);
+    }
 
     if (auto it = j.find ("sources"); it != j.end() && it->is_array())
         for (const auto& s : *it)

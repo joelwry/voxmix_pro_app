@@ -1,5 +1,7 @@
 #include "vox/Engine.h"
 #include "vox/ProjectSerializer.h"
+#include "vox/Analysis.h"
+#include "vox/WavWriter.h"
 #include "voxfx/EffectRegistry.h"
 #include "FileUtils.h"
 #include <nlohmann/json.hpp>
@@ -61,7 +63,7 @@ json descriptorJson (const voxfx::EffectDescriptor& d)
                          : p.type == voxfx::ParamType::Integer ? "integer"
                          : p.type == voxfx::ParamType::Toggle ? "toggle" : "choice";
         json pj = { { "id", p.id }, { "name", p.name }, { "type", type }, { "min", p.min }, { "max", p.max },
-                    { "default", p.def }, { "unit", p.unit }, { "log", p.logScale } };
+                    { "default", p.def }, { "unit", p.unit }, { "log", p.logScale }, { "group", voxfx::paramGroup (d, p) } };
         if (! p.choices.empty()) pj["choices"] = p.choices;
         params.push_back (pj);
     }
@@ -139,6 +141,7 @@ Engine::Engine (std::string dir, std::unique_ptr<IAudioDevice> dev)
     blockL.assign (kMaxBlock, 0.0f);
     blockR.assign (kMaxBlock, 0.0f);
     inputMono.assign (16384, 0.0f);
+    monitorOut.assign (16384, 0.0f);
     calibIn.assign ((size_t) (kCalibFirst + kCalibPeriod * (kCalibClicks + 1)) * 2, 0.0f);
     loudness.prepare (48000);
     cache.sampleRate = 48000;
@@ -174,31 +177,42 @@ Engine::~Engine()
 //==============================================================================
 // Real-time thread
 
-void Engine::onAudio (const float* in, int inChannels, int inFrames, float* out, int outFrames) noexcept
+void Engine::onAudio (const float* in, int inChannels, int inFrames, float* out, int outFrames, const StreamClock& clock) noexcept
 {
     const auto t0 = std::chrono::steady_clock::now();
     callbackSeq.fetch_add (1);   // odd: inside the callback
     MixGraph* g = live.load();
 
     const int64_t seek = pendingSeek.exchange (-1);
-    if (seek >= 0) position.store (seek);
+    if (seek >= 0) { position.store (seek); monitor.reset(); }
     if (loudnessReset.exchange (false)) loudness.reset();
     const bool isPlaying = playing.load();
-    const int64_t pos = position.load();
+    int64_t pos = position.load();
 
-    // input -> mono (selected channel handled by averaging: phone mics are mono)
+    // Input: an open input stream may deliver 0 frames in one callback and more in the next
+    // (full-duplex jitter). Those frames are recorded exactly as delivered: never padded.
+    const bool inputOpen = in != nullptr && inChannels > 0;
     int monoFrames = 0;
-    if (in && inChannels > 0 && inFrames > 0)
+    if (inputOpen && inFrames > 0)
     {
         monoFrames = std::min (inFrames, (int) inputMono.size());
         const float scale = 1.0f / float (inChannels);
+        const bool lowCut = inputLowCutOn.load (std::memory_order_relaxed);
+        float peak = 0.0f;
         for (int i = 0; i < monoFrames; ++i)
         {
             float s = 0.0f;
             for (int c = 0; c < inChannels; ++c) s += in[i * inChannels + c];
-            inputMono[(size_t) i] = s * scale;
+            s *= scale;
+            if (! std::isfinite (s)) s = 0.0f;
+            peak = std::max (peak, std::abs (s));
+            if (lowCut) s = inputHp.process (s);   // 40 Hz high-pass: rumble, handling noise, DC
+            inputMono[(size_t) i] = s;
         }
+        if (peak > inputPeak.load (std::memory_order_relaxed)) inputPeak.store (peak, std::memory_order_relaxed);
+        if (peak >= 0.999f) inputClipped.store (true, std::memory_order_relaxed);
     }
+    if (inFrames > (int) inputMono.size()) inputOverflow.fetch_add (inFrames - (int) inputMono.size(), std::memory_order_relaxed);
 
     if (calibActive.load())
     {
@@ -223,29 +237,66 @@ void Engine::onAudio (const float* in, int inChannels, int inFrames, float* out,
     }
 
     if (recorder.isArmed() || recorder.isCapturing())
-        recorder.capture (monoFrames > 0 ? inputMono.data() : nullptr, monoFrames > 0 ? monoFrames : outFrames, pos);
-
-    MonitorInput mon;
-    const int monTrack = recordTrackIndex.load();
-    const bool monitoring = monitorEnabled.load() && monoFrames > 0 && monTrack >= 0;
-
-    for (int done = 0; done < outFrames; done += kMaxBlock)
     {
-        const int m = std::min (kMaxBlock, outFrames - done);
+        const bool wasCapturing = recorder.isCapturing();
+        if (inputOpen) recorder.capture (inputMono.data(), monoFrames, pos);
+        else recorder.capture (nullptr, outFrames, pos);   // no microphone: keep the timeline
+        if (! wasCapturing && recorder.isCapturing())
+        {
+            // first captured block: remember the stream clock for exact latency at stop
+            recClockValid.store (clock.valid, std::memory_order_relaxed);
+            recClockOut.store (clock.outFramesWritten, std::memory_order_relaxed);
+            recClockIn.store (clock.inFramesRead, std::memory_order_relaxed);
+        }
+    }
+
+    // live monitoring through a small jitter buffer, so uneven input deliveries never cut out
+    const int monTrack = recordTrackIndex.load();
+    const bool monitoring = monitorEnabled.load() && inputOpen && monTrack >= 0 && outFrames <= (int) monitorOut.size();
+    if (monitoring)
+    {
+        monitor.push (inputMono.data(), monoFrames);
+        monitor.pull (monitorOut.data(), outFrames);
+    }
+
+    // looping (not while recording a take)
+    const bool loop = isPlaying && loopOn.load() && ! recorder.isCapturing();
+    const int64_t ls = loopStart.load(), le = loopEnd.load();
+    const bool loopValid = loop && le > ls + 256;
+    if (loopValid && (pos >= le || pos < ls)) pos = ls;
+
+    for (int done = 0; done < outFrames;)
+    {
+        int m = std::min (kMaxBlock, outFrames - done);
+        if (loopValid) m = (int) std::min<int64_t> (m, le - pos);
         if (g)
         {
             MonitorInput mc;
-            if (monitoring && done + m <= monoFrames)
+            if (monitoring)
             {
-                mc.mono = inputMono.data() + done;
+                mc.mono = monitorOut.data() + done;
                 mc.trackIndex = monTrack;
             }
-            renderer.render (*g, pos + done, m, isPlaying, mc, blockL.data(), blockR.data(), &loudness);
+            renderer.render (*g, pos, m, isPlaying, mc, blockL.data(), blockR.data(), &loudness);
         }
         else
         {
             std::fill (blockL.begin(), blockL.begin() + m, 0.0f);
             std::fill (blockR.begin(), blockR.begin() + m, 0.0f);
+        }
+        if (loopValid)
+        {
+            // 2 ms fades at the loop boundary so the jump back never clicks
+            const int64_t fade = std::max<int64_t> (16, (int64_t) (0.002 * (g ? g->sampleRate : 48000.0)));
+            for (int i = 0; i < m; ++i)
+            {
+                const int64_t p = pos + i;
+                float gn = 1.0f;
+                if (le - p < fade) gn = float (le - p) / float (fade);
+                if (loopWrapped && p - ls < fade) gn = std::min (gn, float (p - ls) / float (fade));
+                blockL[(size_t) i] *= gn;
+                blockR[(size_t) i] *= gn;
+            }
         }
         float* o = out + 2 * done;
         for (int i = 0; i < m; ++i)
@@ -253,28 +304,32 @@ void Engine::onAudio (const float* in, int inChannels, int inFrames, float* out,
             o[2 * i] = std::clamp (blockL[(size_t) i], -1.0f, 1.0f);
             o[2 * i + 1] = std::clamp (blockR[(size_t) i], -1.0f, 1.0f);
         }
+        done += m;
+        if (isPlaying) pos += m;
+        if (loopValid && pos >= le) { pos = ls; loopWrapped = true; }
+        else if (loopValid && pos - ls > 4096) loopWrapped = false;
     }
-    (void) mon;
 
     if (isPlaying)
     {
-        position.store (pos + outFrames);
-        // stop automatically two seconds after the end of the song (not while recording)
-        if (g && g->endFrame > 0 && ! recorder.isCapturing() && pos > g->endFrame + (int64_t) (2.0 * g->sampleRate))
+        position.store (pos);
+        // stop automatically two seconds after the end of the song (not while recording or looping)
+        if (g && g->endFrame > 0 && ! loopValid && ! recorder.isCapturing() && pos > g->endFrame + (int64_t) (2.0 * g->sampleRate))
         {
             playing.store (false);
             autoStopped.store (true);
         }
     }
 
+    const double usedSec = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+    if (g && usedSec > double (outFrames) / g->sampleRate) overloads.fetch_add (1, std::memory_order_relaxed);
     callbacks.fetch_add (1, std::memory_order_relaxed);
     callbackFrames.store (outFrames, std::memory_order_relaxed);
     callbackSeq.fetch_add (1);   // even: outside
     if (g && outFrames > 0)
     {
-        const double used = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
         const double budget = double (outFrames) / g->sampleRate;
-        const float load = float (used / budget);
+        const float load = float (usedSec / budget);
         cpuLoad.store (0.9f * cpuLoad.load (std::memory_order_relaxed) + 0.1f * load, std::memory_order_relaxed);
     }
 }
@@ -326,6 +381,39 @@ void Engine::rebuildGraph()
     applyControls (project, cache);
     publish (std::move (g));
     pruneCache (project, cache);
+    applyCompare();
+    syncTransportFromProject();
+}
+
+void Engine::syncTransportFromProject()
+{
+    loopStart.store (project.loopStart);
+    loopEnd.store (project.loopEnd);
+    loopOn.store (project.loopOn && project.loopEnd > project.loopStart);
+    inputLowCutOn.store (project.inputLowCut);
+}
+
+void Engine::applyCompare()
+{
+    // A/B compare: the effects of one destination are bypassed without touching the project
+    if (compareTarget.empty() || ! hasProject) return;
+    std::vector<EffectSlotSpec>* chain = nullptr;
+    if (compareTarget == "master") chain = &project.master.fx;
+    else if (compareTarget.rfind ("track:", 0) == 0) { if (auto* t = project.findTrack (compareTarget.substr (6))) chain = &t->fx; }
+    else if (compareTarget.rfind ("bus:", 0) == 0) { if (auto* b = project.findBus (compareTarget.substr (4))) chain = &b->fx; }
+    else if (compareTarget.rfind ("slot:", 0) == 0)
+    {
+        if (auto it = cache.slots.find (compareTarget.substr (5)); it != cache.slots.end()) it->second->setBypassed (true);
+        return;
+    }
+    else if (compareTarget == "mastering")
+    {
+        if (auto it = cache.slots.find (project.master.mastering.id); it != cache.slots.end()) it->second->setBypassed (true);
+        return;
+    }
+    if (! chain) { compareTarget.clear(); return; }
+    for (const auto& s : *chain)
+        if (auto it = cache.slots.find (s.id); it != cache.slots.end()) it->second->setBypassed (true);
 }
 
 void Engine::markDirty()
@@ -385,8 +473,19 @@ int64_t Engine::latencyCompensation()
     int64_t comp = assumedLatency;
     if (device)
     {
-        const auto st = device->status();
-        if (st.running) comp = st.inputLatencyFrames + st.outputLatencyFrames;
+        // exact: hardware timestamps evaluated at the callback that captured the take's first frame
+        StreamClock c;
+        c.valid = recClockValid.load();
+        c.outFramesWritten = recClockOut.load();
+        c.inFramesRead = recClockIn.load();
+        double rt = 0.0;
+        if (c.valid && device->roundTripLatency (c, rt) && rt > 0.0 && rt < project.sampleRate)
+            comp = (int64_t) std::llround (rt);
+        else
+        {
+            const auto st = device->status();
+            if (st.running) comp = st.inputLatencyFrames + st.outputLatencyFrames;
+        }
     }
     if (liveOwner) comp += liveOwner->masterLatency;
     return comp;
@@ -396,6 +495,10 @@ void Engine::restartDeviceLocked()
 {
     if (! device || ! hasProject) return;
     device->stop();
+    DeviceOptions opt;
+    opt.micMode = project.micMode;
+    opt.latencyMode = project.latencyMode;
+    device->setOptions (opt);
     std::string err;
     if (! device->start (project.sampleRate, wantInput, this, err))
     {
@@ -501,6 +604,18 @@ void Engine::stopRecordingLocked (std::string& resultJson)
     json r;
     r["clip"] = { { "id", clip.id }, { "trackId", track->id }, { "start", clip.start }, { "length", clip.length },
                   { "latencyCompensation", comp }, { "recordedFrames", take.frames } };
+    // take health report: what could have caused clicks or crackle in this take
+    const int64_t overloadsInTake = overloads.load() - recOverloadsAtStart;
+    int64_t xrunsInTake = 0;
+    if (device) xrunsInTake = std::max<int64_t> (0, device->status().inputXruns - recInputXrunsAtStart);
+    const bool clipped = inputClipped.load();
+    json health = { { "droppedFrames", take.droppedFrames }, { "inputOverruns", xrunsInTake }, { "cpuOverloads", overloadsInTake },
+                    { "clipped", clipped }, { "clean", take.droppedFrames == 0 && xrunsInTake == 0 && overloadsInTake == 0 && ! clipped } };
+    r["health"] = health;
+    if (clipped)
+        r["warning"] = "The microphone was too loud and clipped (distortion). Sing a little further from the phone or lower your voice.";
+    else if (xrunsInTake > 0 || take.droppedFrames > 0)
+        r["warning"] = "The phone could not keep up and some microphone audio was lost. Try Latency mode \"Safe\" in Project Settings, or fewer effects while recording.";
     if (! take.error.empty()) r["warning"] = take.error;
     if (! saved) r["warning"] = "Recorded, but the project could not be saved: " + e;
     r["project"] = json::parse (projectToJson (project, false));
@@ -538,6 +653,8 @@ std::string Engine::status()
     if (recorder.isArmed() || recorder.isCapturing())
         s["record"] = { { "frames", recorder.capturedFrames() }, { "dropped", recorder.droppedFrames() },
                         { "inputPeak", round3 (recorder.takeInputPeak()) } };
+    s["input"] = { { "peak", round3 (inputPeak.exchange (0.0f)) }, { "clipped", inputClipped.load() } };
+    s["overloads"] = overloads.load();
     s["export"] = { { "running", exportRunning.load() }, { "progress", round3 (exportProgress.progress.load()) } };
     {
         std::lock_guard<std::mutex> l (exportMutex);
@@ -736,6 +853,7 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         cache.maxBlock = kMaxBlock;
         recorder.prepare (project.sampleRate);
         loudness.prepare (project.sampleRate);
+        inputHp.design (project.sampleRate, 40.0);
         position.store (0);
         pendingSeek.store (-1);
         std::vector<std::string> warnings = lr.warnings;
@@ -829,6 +947,23 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         if (a.contains ("recordOffsetMs"))
             project.recordOffsetFrames = (int64_t) std::llround (std::clamp (arg<double> (a, "recordOffsetMs", 0.0), -500.0, 500.0) * 0.001 * project.sampleRate);
         if (a.contains ("inputMonitoring")) project.inputMonitoring = arg<bool> (a, "inputMonitoring", false);
+        bool deviceChanged = false;
+        if (a.contains ("micMode"))
+        {
+            const auto m = arg<std::string> (a, "micMode", "raw");
+            if (m != "raw" && m != "voice" && m != "auto" && m != "clean") fail ("Unknown microphone mode");
+            deviceChanged |= m != project.micMode;
+            project.micMode = m;
+        }
+        if (a.contains ("latencyMode"))
+        {
+            const auto m = arg<std::string> (a, "latencyMode", "balanced");
+            if (m != "lowest" && m != "balanced" && m != "safe") fail ("Unknown latency mode");
+            deviceChanged |= m != project.latencyMode;
+            project.latencyMode = m;
+        }
+        if (a.contains ("inputLowCut")) project.inputLowCut = arg<bool> (a, "inputLowCut", true);
+        if (deviceChanged && device && device->status().running && ! recorder.active()) restartDeviceLocked();
         if (a.contains ("export") && a["export"].is_object())
         {
             const auto& e = a["export"];
@@ -850,6 +985,8 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         needProject();
         needIdle();
         const std::string path = reqString (a, "path");
+        if (arg<bool> (a, "newLayer", false) && project.vocalLayerCount() >= kMaxVocalLayers)
+            fail ("A project can have up to 10 vocal layers");
         std::string name = arg<std::string> (a, "name", "");
         if (name.empty()) name = path.substr (path.find_last_of ('/') + 1);
         DecodedAudio dec;
@@ -859,6 +996,7 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         const std::string id = makeId ("src");
         auto src = makeSource (id, dec, project.sampleRate);
         if (! src) fail ("The file contains no audio");
+        const int originalRate = dec.sampleRate;
         dec = DecodedAudio {};
 
         // store a normalised copy (project rate, 16-bit WAV) in the project's media folder
@@ -892,7 +1030,20 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         sources[id] = src;
         const std::string targetId = arg<std::string> (a, "trackId", "");
         TrackSpec* t = targetId.empty() ? nullptr : project.findTrack (targetId);
-        if (! t)
+        const bool newLayer = arg<bool> (a, "newLayer", false);
+        if (newLayer)
+        {
+            // import a vocal (or any audio) as a new layer named after the file
+            const int layers = project.vocalLayerCount();
+            TrackSpec nt;
+            nt.id = makeId ("trk");
+            std::string base = name.substr (0, name.find_last_of ('.'));
+            nt.name = (base.empty() ? std::string ("Imported") : base).substr (0, 40);
+            nt.color = kLayerColors[layers % 10];
+            project.tracks.push_back (nt);
+            t = &project.tracks.back();
+        }
+        else if (! t)
         {
             for (auto& tr : project.tracks) if (tr.kind == TrackKind::Beat) { t = &tr; break; }
             if (! t)
@@ -910,18 +1061,39 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         ClipSpec c;
         c.id = makeId ("clp");
         c.sourceId = id;
-        c.start = t->kind == TrackKind::Beat ? 0 : std::max<int64_t> (0, position.load());
+        c.start = t->kind == TrackKind::Beat ? 0 : std::max<int64_t> (0, arg<int64_t> (a, "start", newLayer ? 0 : position.load()));
         c.length = src->frames();
         c.name = name;
         if (t->kind != TrackKind::Beat) clearRange (*t, c.start, c.start + c.length);
         t->clips.push_back (c);
         std::sort (t->clips.begin(), t->clips.end(), [] (const ClipSpec& x, const ClipSpec& y) { return x.start < y.start; });
-        if (project.meta["beatName"].empty() && t->kind == TrackKind::Beat) project.meta["beatName"] = name;
+        if (t->kind == TrackKind::Beat) project.meta["beatName"] = name;
+        json analysisJson = nullptr;
+        if (t->kind == TrackKind::Beat && arg<bool> (a, "analyze", true))
+        {
+            // detect tempo and key of the new beat; the tempo is applied when the estimate is solid
+            const auto an = analyseMusic (*src);
+            auto& pa = project.analysis;
+            pa.done = an.valid;
+            pa.sourceId = id;
+            pa.bpm = an.bpm;
+            pa.bpmConfidence = an.bpmConfidence;
+            pa.keyRoot = an.keyRoot;
+            pa.keyMinor = an.keyMinor;
+            pa.keyConfidence = an.keyConfidence;
+            pa.altKeyRoot = an.altKeyRoot;
+            pa.altKeyMinor = an.altKeyMinor;
+            bool tempoApplied = false;
+            if (an.bpm > 0 && an.bpmConfidence >= 0.1f && arg<bool> (a, "applyTempo", true)) { project.bpm = an.bpm; tempoApplied = true; }
+            analysisJson = { { "bpm", an.bpm }, { "bpmConfidence", round3 (an.bpmConfidence) }, { "tempoApplied", tempoApplied },
+                             { "key", an.keyRoot >= 0 ? keyName (an.keyRoot, an.keyMinor) : "" }, { "keyConfidence", round3 (an.keyConfidence) },
+                             { "altKey", an.altKeyRoot >= 0 ? keyName (an.altKeyRoot, an.altKeyMinor) : "" } };
+        }
         markDirty();
         rebuildGraph();
         if (! saveLocked (err)) fail ("Imported, but the project could not be saved: " + err);
         return projectReply ({ { "sourceId", id }, { "clipId", c.id }, { "trackId", t->id }, { "seconds", double (src->frames()) / project.sampleRate },
-                               { "originalRate", dec.sampleRate } });
+                               { "originalRate", originalRate }, { "analysis", analysisJson } });
     }
     if (method == "getWaveform")
     {
@@ -948,7 +1120,13 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         needProject();
         if (device && ! device->status().running) restartDeviceLocked();
         const int64_t end = liveOwner ? liveOwner->endFrame : 0;
-        if (end > 0 && position.load() >= end) { pendingSeek.store (0); if (! device || ! device->status().running) position.store (0); }
+        const bool devRunning = device && device->status().running;
+        if (project.loopOn && project.loopEnd > project.loopStart
+            && (position.load() < project.loopStart || position.load() >= project.loopEnd))
+        {
+            if (devRunning) pendingSeek.store (project.loopStart); else position.store (project.loopStart);
+        }
+        else if (end > 0 && position.load() >= end) { if (devRunning) pendingSeek.store (0); else position.store (0); }
         playStartPosition.store (position.load());
         loudnessReset.store (true);
         playing.store (true);
@@ -967,6 +1145,43 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         const int64_t to = arg<bool> (a, "toStart", false) ? 0 : playStartPosition.load();
         if (device && device->status().running) pendingSeek.store (to); else position.store (to);
         return okJson ({ { "position", to } });
+    }
+    if (method == "setLoop")
+    {
+        // loop a region while playing (e.g. a chorus while dialling in effects)
+        needProject();
+        const double sr = project.sampleRate;
+        auto frameArg = [&] (const char* key, const char* secKey, int64_t def)
+        {
+            if (a.contains (secKey)) return (int64_t) std::llround (arg<double> (a, secKey, 0.0) * sr);
+            return arg<int64_t> (a, key, def);
+        };
+        int64_t ls = std::max<int64_t> (0, frameArg ("start", "startSeconds", project.loopStart));
+        int64_t le = std::max<int64_t> (0, frameArg ("end", "endSeconds", project.loopEnd));
+        if (le < ls) std::swap (ls, le);
+        const bool on = arg<bool> (a, "enabled", project.loopOn);
+        if (on && le - ls < (int64_t) (0.25 * sr)) fail ("The loop must be at least a quarter of a second long");
+        project.loopStart = ls;
+        project.loopEnd = le;
+        project.loopOn = on && le > ls;
+        syncTransportFromProject();
+        markDirty();
+        return projectReply();
+    }
+    if (method == "setCompare")
+    {
+        // A/B: temporarily bypass the effects of a destination ("track:<id>", "bus:<id>", "master",
+        // "mastering", "slot:<slotId>") to hear the dry signal; nothing is saved
+        needProject();
+        const bool on = arg<bool> (a, "enabled", false);
+        compareTarget.clear();
+        { applyControls (project, cache); }
+        if (on)
+        {
+            compareTarget = reqString (a, "target");
+            applyCompare();
+        }
+        return okJson ({ { "comparing", ! compareTarget.empty() }, { "target", compareTarget } });
     }
     if (method == "seek")
     {
@@ -1004,6 +1219,10 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         const std::string id = makeId ("rec");
         const std::string path = projectFolder() + "/media/" + id + ".wav";
         if (! recorder.begin (path, t.id, err)) fail (err);
+        inputClipped.store (false);
+        recClockValid.store (false);
+        recOverloadsAtStart = overloads.load();
+        recInputXrunsAtStart = device ? device->status().inputXruns : 0;
         int idx = 0;
         for (size_t i = 0; i < project.tracks.size(); ++i) if (project.tracks[i].id == t.id) idx = (int) i;
         recordTrackIndex.store (idx);
@@ -1109,7 +1328,7 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
             rebuild = true;
         }
         markDirty();
-        if (rebuild) rebuildGraph(); else applyControls (project, cache);
+        if (rebuild) rebuildGraph(); else { applyControls (project, cache); applyCompare(); }
         return a.value ("quiet", false) ? okJson() : projectReply();
     }
     if (method == "moveTrack")
@@ -1258,6 +1477,12 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
             fail ("The mastering chain lives in the Mastering workspace");
         if (a.contains ("params") && a["params"].is_object())
             for (auto& [k, v] : a["params"].items()) if (v.is_number()) s.params[k] = v.get<float>();
+        if (s.type == "pitch_correction" && ! s.params.count ("key") && project.analysis.keyRoot >= 0)
+        {
+            // start in the song's detected key
+            s.params["key"] = (float) project.analysis.keyRoot;
+            s.params["scale"] = project.analysis.keyMinor ? 2.0f : 1.0f;
+        }
         normaliseSlot (s);
         pushUndo();
         const int idx = std::clamp (arg<int> (a, "index", (int) chain.size()), 0, (int) chain.size());
@@ -1413,7 +1638,7 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         if (a.contains ("pan")) b->pan = std::clamp (arg<float> (a, "pan", 0.0f), -1.0f, 1.0f);
         if (a.contains ("mute")) b->mute = arg<bool> (a, "mute", false);
         markDirty();
-        applyControls (project, cache);
+        { applyControls (project, cache); applyCompare(); }
         return a.value ("quiet", false) ? okJson() : projectReply();
     }
 
@@ -1426,7 +1651,7 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         if (a.contains ("masteringOn")) project.master.masteringOn = arg<bool> (a, "masteringOn", false);
         if (a.contains ("loudnessTarget")) project.master.loudnessTarget = std::clamp (arg<float> (a, "loudnessTarget", -14.0f), -30.0f, -5.0f);
         markDirty();
-        applyControls (project, cache);
+        { applyControls (project, cache); applyCompare(); }
         return a.value ("quiet", false) ? okJson() : projectReply();
     }
     if (method == "listMasteringPresets")
@@ -1450,7 +1675,7 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         project.master.loudnessTarget = mp->loudnessTarget;
         project.master.masteringOn = true;
         markDirty();
-        applyControls (project, cache);
+        { applyControls (project, cache); applyCompare(); }
         return projectReply();
     }
     if (method == "analyzeMix" || method == "autoMaster")
@@ -1495,7 +1720,7 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         m.params["inputGain"] = std::round (gain * 10.0f) / 10.0f;
         project.master.loudnessTarget = target;
         markDirty();
-        applyControls (project, cache);
+        { applyControls (project, cache); applyCompare(); }
         return projectReply ({ { "before", { { "integratedLufs", round3 (before.integratedLufs) }, { "truePeakDb", round3 (before.truePeakDb) } } },
                                { "after", { { "integratedLufs", round3 (after.integratedLufs) }, { "truePeakDb", round3 (after.truePeakDb) } } },
                                { "inputGain", m.params["inputGain"] } });
@@ -1651,6 +1876,162 @@ std::string Engine::dispatch (const std::string& method, const std::string& args
         std::lock_guard<std::mutex> l (exportMutex);
         if (exportResult.empty()) fail ("No export has run");
         return okJson ({ { "running", false }, { "result", json::parse (exportResult) } });
+    }
+
+    //-------------------------------------------------------------------- analysis & clean-up
+    if (method == "analyzeBeat")
+    {
+        // (re)detect tempo and key of the beat, or of any source
+        needProject();
+        std::string sid = arg<std::string> (a, "sourceId", "");
+        if (sid.empty())
+            for (const auto& t : project.tracks)
+                if (t.kind == TrackKind::Beat && ! t.clips.empty()) sid = t.clips.front().sourceId;
+        auto it = sources.find (sid);
+        if (it == sources.end()) fail ("Import a beat first");
+        const auto an = analyseMusic (*it->second);
+        if (! an.valid) fail ("Could not detect tempo or key (the audio may be too short or too quiet)");
+        pushUndo();
+        auto& pa = project.analysis;
+        pa.done = true; pa.sourceId = sid; pa.bpm = an.bpm; pa.bpmConfidence = an.bpmConfidence;
+        pa.keyRoot = an.keyRoot; pa.keyMinor = an.keyMinor; pa.keyConfidence = an.keyConfidence;
+        pa.altKeyRoot = an.altKeyRoot; pa.altKeyMinor = an.altKeyMinor;
+        if (arg<bool> (a, "applyTempo", false) && an.bpm > 0) project.bpm = an.bpm;
+        markDirty();
+        rebuildGraph();
+        return projectReply ({ { "analysis", { { "bpm", an.bpm }, { "bpmConfidence", round3 (an.bpmConfidence) },
+                                               { "key", an.keyRoot >= 0 ? keyName (an.keyRoot, an.keyMinor) : "" },
+                                               { "keyConfidence", round3 (an.keyConfidence) },
+                                               { "altKey", an.altKeyRoot >= 0 ? keyName (an.altKeyRoot, an.altKeyMinor) : "" } } } });
+    }
+    if (method == "setKey")
+    {
+        // user override (or confirmation) of the song key
+        needProject();
+        pushUndo();
+        project.analysis.keyRoot = std::clamp (arg<int> (a, "root", project.analysis.keyRoot), -1, 11);
+        project.analysis.keyMinor = arg<bool> (a, "minor", project.analysis.keyMinor);
+        project.analysis.keyConfidence = 1.0f;
+        markDirty();
+        return projectReply();
+    }
+    if (method == "applyKeyToPitchCorrection")
+    {
+        // set key + scale on every Pitch Correction in the project from the song key
+        needProject();
+        const int root = arg<int> (a, "root", project.analysis.keyRoot);
+        const bool minor = arg<bool> (a, "minor", project.analysis.keyMinor);
+        if (root < 0 || root > 11) fail ("The song key is not known yet: import a beat or set the key");
+        pushUndo();
+        int changed = 0;
+        auto apply = [&] (std::vector<EffectSlotSpec>& fx)
+        {
+            for (auto& s : fx)
+                if (s.type == "pitch_correction")
+                {
+                    s.params["key"] = (float) root;
+                    s.params["scale"] = minor ? 2.0f : 1.0f;
+                    ++changed;
+                }
+        };
+        for (auto& t : project.tracks) apply (t.fx);
+        for (auto& b : project.buses) apply (b.fx);
+        apply (project.master.fx);
+        markDirty();
+        { applyControls (project, cache); applyCompare(); }
+        return projectReply ({ { "changed", changed } });
+    }
+    if (method == "denoiseClip")
+    {
+        // non-destructive noise clean-up: writes a cleaned copy of the clip's audio and points the
+        // clip at it (undo returns to the original recording, which is kept)
+        needProject();
+        needIdle();
+        TrackSpec* owner = nullptr;
+        auto& clip = clipRef (reqString (a, "clipId"), &owner);
+        auto it = sources.find (clip.sourceId);
+        if (it == sources.end()) fail ("Audio not loaded");
+        const float amount = std::clamp (arg<float> (a, "reductionDb", 12.0f), 3.0f, 30.0f);
+        const auto& src = *it->second;
+        std::vector<std::vector<float>> planar ((size_t) src.channels(), std::vector<float> ((size_t) src.frames()));
+        for (int c = 0; c < src.channels(); ++c)
+            for (int64_t i = 0; i < src.frames(); ++i) planar[(size_t) c][(size_t) i] = src.sample (c, i);
+        auto clean = reduceNoise (planar, project.sampleRate, amount);
+        const std::string nid = makeId ("src");
+        SourceSpec spec;
+        spec.id = nid;
+        spec.file = "media/" + nid + ".wav";
+        const auto* old = project.findSource (clip.sourceId);
+        spec.originalName = (old ? old->originalName : std::string ("Take")) + " (cleaned)";
+        spec.frames = src.frames();
+        spec.channels = src.channels();
+        spec.sampleRate = project.sampleRate;
+        spec.recorded = old && old->recorded;
+        {
+            WavWriter w;
+            if (! w.open (mediaPath (spec.file), project.sampleRate, spec.channels, 32, err)) fail (err);
+            std::vector<float> inter ((size_t) (8192 * spec.channels));
+            for (int64_t f = 0; f < spec.frames; f += 8192)
+            {
+                const int nf = (int) std::min<int64_t> (8192, spec.frames - f);
+                for (int i = 0; i < nf; ++i)
+                    for (int c = 0; c < spec.channels; ++c) inter[(size_t) (i * spec.channels + c)] = clean[(size_t) c][(size_t) (f + i)];
+                if (! w.write (inter.data(), nf)) { w.close(); std::remove (mediaPath (spec.file).c_str()); fail ("Storage is full"); }
+            }
+            if (! w.close()) fail ("The cleaned audio could not be saved");
+        }
+        std::vector<std::vector<int16_t>> pl ((size_t) spec.channels, std::vector<int16_t> ((size_t) spec.frames));
+        for (int c = 0; c < spec.channels; ++c)
+            for (int64_t i = 0; i < spec.frames; ++i)
+                pl[(size_t) c][(size_t) i] = (int16_t) std::lrint (std::clamp (clean[(size_t) c][(size_t) i], -1.0f, 1.0f) * 32767.0f);
+        pushUndo();
+        project.sources.push_back (spec);
+        sources[nid] = std::make_shared<AudioSource> (nid, project.sampleRate, spec.channels, std::move (pl));
+        clip.sourceId = nid;   // same offset/length: the cleaned file is sample-aligned with the original
+        markDirty();
+        rebuildGraph();
+        if (! saveLocked (err)) fail (err);
+        return projectReply ({ { "sourceId", nid } });
+    }
+    if (method == "listEffectPresets")
+    {
+        // presets that belong to one effect type (e.g. the VocalSweet plugin's own presets)
+        const std::string type = reqString (a, "type");
+        json list = json::array();
+        if (type == "vocal_sweetener")
+            for (const auto& n : voxfx::vocalSweetPresetNames()) list.push_back ({ { "id", n }, { "name", n } });
+        else if (type == "mastering")
+            for (const auto& p : masteringPresets()) list.push_back ({ { "id", p.id }, { "name", p.name } });
+        return okJson ({ { "presets", list } });
+    }
+    if (method == "applyEffectPreset")
+    {
+        needProject();
+        const std::string target = reqString (a, "target");
+        auto& spec = slotSpec (target, arg<std::string> (a, "slotId", ""));
+        const std::string pid = reqString (a, "presetId");
+        std::map<std::string, float> values;
+        if (spec.type == "vocal_sweetener")
+        {
+            std::vector<std::pair<std::string, float>> v;
+            if (! voxfx::vocalSweetPresetValues (pid, v)) fail ("Preset not found");
+            for (auto& [k, x] : v) values[k] = x;
+        }
+        else if (spec.type == "mastering")
+        {
+            const auto* mp = findMasteringPreset (pid);
+            if (! mp) fail ("Preset not found");
+            values = mp->params;
+            project.master.masteringPreset = mp->id;
+            project.master.loudnessTarget = mp->loudnessTarget;
+        }
+        else fail ("This effect has no presets");
+        pushUndo();
+        spec.params = values;
+        normaliseSlot (spec);
+        markDirty();
+        { applyControls (project, cache); applyCompare(); }
+        return projectReply();
     }
 
     //-------------------------------------------------------------------- library & app settings

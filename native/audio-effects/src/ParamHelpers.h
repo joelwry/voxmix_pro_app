@@ -37,6 +37,13 @@ inline ParamInfo choice (const char* id, const char* name, std::vector<std::stri
     return p;
 }
 
+/** Assigns a UI page to a parameter. */
+inline ParamInfo grp (ParamInfo p, const char* group)
+{
+    p.group = group;
+    return p;
+}
+
 inline float dbToGain (float db) noexcept { return std::pow (10.0f, db * 0.05f); }
 inline float gainToDb (float g) noexcept { return 20.0f * std::log10 (std::max (g, 1.0e-9f)); }
 

@@ -16,6 +16,7 @@
 #include "OfflineRenderer.h"
 #include "Presets.h"
 #include "RecordingManager.h"
+#include "RtHelpers.h"
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -43,7 +44,8 @@ public:
     std::string status();
 
     // AudioCallback
-    void onAudio (const float* in, int inChannels, int inFrames, float* out, int outFrames) noexcept override;
+    void onAudio (const float* in, int inChannels, int inFrames, float* out, int outFrames,
+                  const StreamClock& clock) noexcept override;
     void onDeviceError (const std::string& message) noexcept override;
 
     /** For tests: latency the engine assumes when no device is attached (frames). */
@@ -114,6 +116,26 @@ private:
     std::atomic<int> recordTrackIndex { -1 };
     std::atomic<bool> monitorEnabled { false };
     std::string recordTrackId;
+
+    // microphone path (audio thread state + metering)
+    HighPass inputHp;
+    std::atomic<bool> inputLowCutOn { true };
+    std::atomic<float> inputPeak { 0.0f };
+    std::atomic<bool> inputClipped { false };
+    std::atomic<int64_t> inputOverflow { 0 }, overloads { 0 };
+    MonitorFifo monitor;
+    std::vector<float> monitorOut;
+    std::atomic<bool> recClockValid { false };
+    std::atomic<int64_t> recClockOut { 0 }, recClockIn { 0 };
+    int64_t recOverloadsAtStart = 0, recInputXrunsAtStart = 0;
+
+    // loop region (frames) and A/B compare
+    std::atomic<bool> loopOn { false };
+    std::atomic<int64_t> loopStart { 0 }, loopEnd { 0 };
+    bool loopWrapped = false;   // audio thread
+    std::string compareTarget;  // destination whose effects are temporarily bypassed
+    void applyCompare();
+    void syncTransportFromProject();
 
     // latency calibration (loopback click test)
     std::atomic<bool> calibActive { false };
